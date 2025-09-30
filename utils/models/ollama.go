@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -94,8 +95,13 @@ func (o *OllamaProvider) SendPrompt(modelName string, prompt string) (string, er
 	// Use retry mechanism for API calls
 	result, err := retry.WithRetry(
 		func() (interface{}, error) {
+			ollamaHost := os.Getenv("OLLAMA_HOST")
+			if ollamaHost == "" {
+				ollamaHost = "http://localhost:11434"
+			}
+
 			client := &http.Client{Timeout: 30 * time.Second} // Add a 30-second timeout
-			resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(jsonData))
+			resp, err := client.Post(ollamaHost+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
 			if err != nil {
 				o.debugf("Error calling Ollama API: %v", err)
 				return "", fmt.Errorf("error calling Ollama API: %v (is Ollama running?)", err)
@@ -178,8 +184,13 @@ func (o *OllamaProvider) SendPromptWithFile(modelName string, prompt string, fil
 	// Use retry mechanism for API calls
 	result, err := retry.WithRetry(
 		func() (interface{}, error) {
+			ollamaHost := os.Getenv("OLLAMA_HOST")
+			if ollamaHost == "" {
+				ollamaHost = "http://localhost:11434"
+			}
+
 			client := &http.Client{Timeout: 30 * time.Second} // Add a 30-second timeout
-			resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(jsonData))
+			resp, err := client.Post(ollamaHost+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
 			if err != nil {
 				return "", fmt.Errorf("error calling Ollama API: %v", err)
 			}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -77,8 +78,13 @@ type OllamaModelTag struct {
 
 // isModelAvailableLocally checks if a model is available in the local Ollama instance
 func isModelAvailableLocally(modelName string) bool {
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	if ollamaHost == "" {
+		ollamaHost = "http://localhost:11434"
+	}
+
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://localhost:11434/api/tags")
+	resp, err := client.Get(ollamaHost + "/api/tags")
 	if err != nil {
 		config.DebugLog("[Provider] Failed to connect to Ollama: %v", err)
 		return false
