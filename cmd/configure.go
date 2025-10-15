@@ -211,7 +211,12 @@ func getMoonshotModels() []string {
 }
 
 func getOllamaModels() ([]OllamaModel, error) {
-	resp, err := http.Get("http://localhost:11434/api/tags")
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	if ollamaHost == "" {
+		ollamaHost = "http://localhost:11434"
+	}
+
+	resp, err := http.Get(ollamaHost + "/api/tags")
 	if err != nil {
 		return nil, fmt.Errorf("error connecting to Ollama API: %v", err)
 	}

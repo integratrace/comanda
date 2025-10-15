@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -28,11 +29,16 @@ type OllamaModelTag struct {
 
 // checkOllamaModelExists queries the local Ollama instance to see if a model tag exists.
 func checkOllamaModelExists(modelName string) (bool, error) {
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	if ollamaHost == "" {
+		ollamaHost = "http://localhost:11434"
+	}
+
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("http://localhost:11434/api/tags")
+	resp, err := client.Get(ollamaHost + "/api/tags")
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
-			return false, fmt.Errorf("failed to connect to Ollama at http://localhost:11434 to verify model '%s'. Is Ollama running?", modelName)
+			return false, fmt.Errorf("failed to connect to Ollama at %s to verify model '%s'. Is Ollama running?", ollamaHost, modelName)
 		}
 		return false, fmt.Errorf("error calling Ollama /api/tags to verify model '%s': %v", modelName, err)
 	}
