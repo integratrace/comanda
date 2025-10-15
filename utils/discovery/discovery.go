@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -112,7 +113,12 @@ func GetOllamaModels() ([]OllamaModel, error) {
 		return nil, fmt.Errorf("Ollama is not installed or not running")
 	}
 
-	resp, err := http.Get("http://localhost:11434/api/tags")
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	if ollamaHost == "" {
+		ollamaHost = "http://localhost:11434"
+	}
+
+	resp, err := http.Get(ollamaHost + "/api/tags")
 	if err != nil {
 		return nil, fmt.Errorf("error connecting to Ollama API: %v", err)
 	}
