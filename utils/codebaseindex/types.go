@@ -72,6 +72,12 @@ type Config struct {
 	ParserPlugins     []ParserPluginConfig
 	ParserPluginPaths []string
 
+	// ExtraAdapters registers in-process adapters supplied by an embedder.
+	// Unlike ParserPlugins these need no executable on disk, so a library
+	// caller can index a project-specific source format directly. Names must
+	// not collide with a built-in adapter or a parser plugin.
+	ExtraAdapters []Adapter
+
 	// Processing options
 	MaxOutputKB   int
 	HashAlgorithm HashAlgorithm

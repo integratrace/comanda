@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -52,6 +53,19 @@ func NewManager(config *Config, verbose bool) (*Manager, error) {
 		// Keep later adapter selection consistent with normalized plugin names
 		// and extensions (for example, "templatex" becomes ".templatex").
 		config.ParserPlugins[i] = adapter.config
+	}
+
+	for _, adapter := range config.ExtraAdapters {
+		if adapter == nil {
+			return nil, fmt.Errorf("extra adapter must not be nil")
+		}
+		if adapter.Name() == "" {
+			return nil, fmt.Errorf("extra adapter must have a name")
+		}
+		if _, exists := m.registry.Get(adapter.Name()); exists {
+			return nil, fmt.Errorf("extra adapter %q conflicts with an existing adapter", adapter.Name())
+		}
+		m.registry.Register(adapter)
 	}
 
 	return m, nil
@@ -204,6 +218,10 @@ func (m *Manager) detectAdapters() []Adapter {
 				seen[name] = true
 			}
 		}
+		// AdapterOverrides is a map, so sort before lookup: scanning routes each
+		// file to the first adapter claiming its extension, and an unordered
+		// name list would vary that routing between processes.
+		sort.Strings(names)
 		// Parser plugins are an explicit opt-in. Keep them active even when a
 		// workflow also narrows the built-in adapter set with overrides.
 		for _, plugin := range m.config.ParserPlugins {

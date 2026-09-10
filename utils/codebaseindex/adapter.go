@@ -3,6 +3,7 @@ package codebaseindex
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -81,29 +82,46 @@ func (r *Registry) Get(name string) (Adapter, bool) {
 	return a, ok
 }
 
-// All returns all registered adapters
+// All returns all registered adapters, sorted by name.
+//
+// The order matters: scanning routes each file to the FIRST adapter claiming
+// its extension, so an unordered (map-iteration) result would assign languages
+// differently from one process to the next whenever two adapters share an
+// extension.
 func (r *Registry) All() []Adapter {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	result := make([]Adapter, 0, len(r.adapters))
-	for _, a := range r.adapters {
-		result = append(result, a)
-	}
-	return result
+	return r.sortedLocked(r.adapters)
 }
 
-// Detect identifies which adapters apply to the given repository
+// Detect identifies which adapters apply to the given repository, sorted by
+// name for the same first-match determinism reason as All.
 func (r *Registry) Detect(repoPath string) []Adapter {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var detected []Adapter
-	for _, adapter := range r.adapters {
+	detected := make(map[string]Adapter, len(r.adapters))
+	for name, adapter := range r.adapters {
 		if r.detectAdapter(repoPath, adapter) {
-			detected = append(detected, adapter)
+			detected[name] = adapter
 		}
 	}
-	return detected
+	return r.sortedLocked(detected)
+}
+
+// sortedLocked returns the adapters ordered by name. Callers must hold r.mu.
+func (r *Registry) sortedLocked(adapters map[string]Adapter) []Adapter {
+	names := make([]string, 0, len(adapters))
+	for name := range adapters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	result := make([]Adapter, 0, len(names))
+	for _, name := range names {
+		result = append(result, adapters[name])
+	}
+	return result
 }
 
 // detectAdapter checks if a specific adapter applies to the repo
