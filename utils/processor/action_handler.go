@@ -30,8 +30,10 @@ type ActionResult struct {
 }
 
 // processActions handles the action section of the DSL
-// Returns ActionResult which may contain either combined or individual results
-func (p *Processor) processActions(modelNames []string, actions []string) (*ActionResult, error) {
+// Returns ActionResult which may contain either combined or individual results.
+// stepConfig carries the step's optional system prompt (instructions) and
+// generation settings; it may be nil.
+func (p *Processor) processActions(modelNames []string, actions []string, stepConfig *StepConfig) (*ActionResult, error) {
 	if len(modelNames) == 0 {
 		return nil, fmt.Errorf("no model specified for actions")
 	}
@@ -144,7 +146,7 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 					}, nil
 				}
 			}
-			result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, action, isAgenticMode, agenticConfig)
+			result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, action, isAgenticMode, agenticConfig, stepConfig)
 			if err != nil {
 				return nil, err
 			}
@@ -255,7 +257,7 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 					}
 				}
 				// Non-agentic mode: use SendPromptWithFile as before.
-				result, err := p.sendPromptWithFileAgenticTimeout(configuredProvider, resolvedModelName, action, fileInputs[0], isAgenticMode, agenticConfig)
+				result, err := p.sendPromptWithFileAgenticTimeout(configuredProvider, resolvedModelName, action, fileInputs[0], isAgenticMode, agenticConfig, stepConfig)
 				if err != nil {
 					return nil, err
 				}
@@ -284,7 +286,7 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 					combinedPrompt += fmt.Sprintf("File %d (%s):\n%s\n\n", i+1, file.Path, string(content))
 				}
 				combinedPrompt += fmt.Sprintf("\nAction: %s", action)
-				result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, combinedPrompt, isAgenticMode, agenticConfig)
+				result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, combinedPrompt, isAgenticMode, agenticConfig, stepConfig)
 				if err != nil {
 					return nil, err
 				}
@@ -308,7 +310,7 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 				// Detect output format from action to provide appropriate instructions
 				// Try to process each file individually
 				result, err := p.sendPromptWithFileAgenticTimeout(configuredProvider, resolvedModelName,
-					fmt.Sprintf("%sFor this file: %s", PromptPrefix, action), file, isAgenticMode, agenticConfig)
+					fmt.Sprintf("%sFor this file: %s", PromptPrefix, action), file, isAgenticMode, agenticConfig, stepConfig)
 
 				if err != nil {
 					// Log error but continue with other files if skipErrors is true
@@ -392,7 +394,7 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 				}
 			}
 
-			result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, combinedPrompt, isAgenticMode, agenticConfig)
+			result, err := p.sendPromptWithAgenticTimeout(configuredProvider, resolvedModelName, combinedPrompt, isAgenticMode, agenticConfig, stepConfig)
 			if err != nil {
 				return nil, err
 			}
@@ -406,9 +408,60 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 	return nil, fmt.Errorf("no actions processed")
 }
 
+// stepSystemPrompt returns the step's system prompt (instructions), if any.
+func stepSystemPrompt(stepConfig *StepConfig) string {
+	if stepConfig == nil {
+		return ""
+	}
+	return stepConfig.Instructions
+}
+
+// applyStepModelConfig pushes a step's generation settings onto the provider
+// when it implements models.ModelConfigurer. Only fields the step actually set
+// are overridden; the rest keep the provider's current values.
+func (p *Processor) applyStepModelConfig(provider models.Provider, stepConfig *StepConfig) {
+	if stepConfig == nil {
+		return
+	}
+	if stepConfig.Temperature == 0 && stepConfig.MaxOutputTokens == 0 && stepConfig.TopP == 0 {
+		return
+	}
+
+	configurer, ok := provider.(models.ModelConfigurer)
+	if !ok {
+		p.debugf("Provider %s does not implement ModelConfigurer; ignoring step generation settings", provider.Name())
+		return
+	}
+
+	// Start from the provider's current settings so unset step fields keep
+	// their defaults rather than collapsing to zero.
+	cfg := models.ModelConfig{}
+	if getter, ok := provider.(interface {
+		GetConfig() models.ModelConfig
+	}); ok {
+		cfg = getter.GetConfig()
+	}
+
+	if stepConfig.Temperature != 0 {
+		cfg.Temperature = stepConfig.Temperature
+	}
+	if stepConfig.MaxOutputTokens != 0 {
+		cfg.MaxTokens = stepConfig.MaxOutputTokens
+		cfg.MaxCompletionTokens = stepConfig.MaxOutputTokens
+	}
+	if stepConfig.TopP != 0 {
+		cfg.TopP = stepConfig.TopP
+	}
+
+	p.debugf("Applying step model config to %s: Temperature=%.2f MaxTokens=%d TopP=%.2f",
+		provider.Name(), cfg.Temperature, cfg.MaxTokens, cfg.TopP)
+	configurer.SetConfig(cfg)
+}
+
 // sendPromptWithAgenticTimeout applies an agentic loop's Codex-specific
-// watchdog without changing timeouts for other providers.
-func (p *Processor) sendPromptWithAgenticTimeout(provider models.Provider, modelName, prompt string, isAgenticMode bool, config *AgenticLoopConfig) (string, error) {
+// watchdog without changing timeouts for other providers. A step's system
+// prompt and generation settings are applied when the provider supports them.
+func (p *Processor) sendPromptWithAgenticTimeout(provider models.Provider, modelName, prompt string, isAgenticMode bool, config *AgenticLoopConfig, stepConfig *StepConfig) (string, error) {
 	if isAgenticMode {
 		if codex, ok := provider.(*models.OpenAICodexProvider); ok {
 			timeoutSeconds := 0
@@ -419,12 +472,24 @@ func (p *Processor) sendPromptWithAgenticTimeout(provider models.Provider, model
 			return codex.SendPromptWithTimeout(modelName, prompt, timeoutSeconds)
 		}
 	}
+
+	p.applyStepModelConfig(provider, stepConfig)
+
+	if system := stepSystemPrompt(stepConfig); system != "" {
+		if sp, ok := provider.(models.SystemPrompter); ok {
+			p.debugf("Using system prompt with provider %s (%d characters)", provider.Name(), len(system))
+			return sp.SendPromptWithSystem(modelName, system, prompt)
+		}
+		p.debugf("Provider %s does not implement SystemPrompter; prepending instructions to the prompt", provider.Name())
+		prompt = system + "\n\n" + prompt
+	}
+
 	return provider.SendPrompt(modelName, prompt)
 }
 
 // sendPromptWithFileAgenticTimeout is the file-input counterpart to
 // sendPromptWithAgenticTimeout.
-func (p *Processor) sendPromptWithFileAgenticTimeout(provider models.Provider, modelName, prompt string, file models.FileInput, isAgenticMode bool, config *AgenticLoopConfig) (string, error) {
+func (p *Processor) sendPromptWithFileAgenticTimeout(provider models.Provider, modelName, prompt string, file models.FileInput, isAgenticMode bool, config *AgenticLoopConfig, stepConfig *StepConfig) (string, error) {
 	if isAgenticMode {
 		if codex, ok := provider.(*models.OpenAICodexProvider); ok {
 			timeoutSeconds := 0
@@ -435,6 +500,18 @@ func (p *Processor) sendPromptWithFileAgenticTimeout(provider models.Provider, m
 			return codex.SendPromptWithFileWithTimeout(modelName, prompt, file, timeoutSeconds)
 		}
 	}
+
+	p.applyStepModelConfig(provider, stepConfig)
+
+	if system := stepSystemPrompt(stepConfig); system != "" {
+		if sp, ok := provider.(models.SystemPrompter); ok {
+			p.debugf("Using system prompt with provider %s (%d characters)", provider.Name(), len(system))
+			return sp.SendPromptWithFileAndSystem(modelName, system, prompt, file)
+		}
+		p.debugf("Provider %s does not implement SystemPrompter; prepending instructions to the prompt", provider.Name())
+		prompt = system + "\n\n" + prompt
+	}
+
 	return provider.SendPromptWithFile(modelName, prompt, file)
 }
 

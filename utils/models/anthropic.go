@@ -91,6 +91,7 @@ type anthropicRequest struct {
 	MaxTokens   int                `json:"max_tokens"`
 	Temperature float64            `json:"temperature,omitempty"`
 	TopP        float64            `json:"top_p,omitempty"`
+	System      string             `json:"system,omitempty"`
 }
 
 type anthropicResponse struct {
@@ -104,8 +105,18 @@ type anthropicResponse struct {
 
 // SendPrompt sends a prompt to the specified model and returns the response
 func (a *AnthropicProvider) SendPrompt(modelName string, prompt string) (string, error) {
+	return a.SendPromptWithSystem(modelName, "", prompt)
+}
+
+// SendPromptWithSystem sends a prompt with an optional system prompt, which the
+// Messages API takes as a top-level field rather than a message. An empty
+// system string is omitted from the request.
+func (a *AnthropicProvider) SendPromptWithSystem(modelName string, system string, prompt string) (string, error) {
 	a.debugf("Preparing to send prompt to model: %s", modelName)
 	a.debugf("Prompt length: %d characters", len(prompt))
+	if system != "" {
+		a.debugf("System prompt length: %d characters", len(system))
+	}
 
 	if a.apiKey == "" {
 		return "", fmt.Errorf("Anthropic provider not configured: missing API key")
@@ -134,6 +145,7 @@ func (a *AnthropicProvider) SendPrompt(modelName string, prompt string) (string,
 			},
 		},
 		MaxTokens: a.config.MaxTokens,
+		System:    system,
 	}
 
 	// Claude 4+ models only support either temperature OR top_p, not both
@@ -214,8 +226,17 @@ func (a *AnthropicProvider) SendPrompt(modelName string, prompt string) (string,
 
 // SendPromptWithFile sends a prompt along with a file to the specified model and returns the response
 func (a *AnthropicProvider) SendPromptWithFile(modelName string, prompt string, file FileInput) (string, error) {
+	return a.SendPromptWithFileAndSystem(modelName, "", prompt, file)
+}
+
+// SendPromptWithFileAndSystem is the file-input counterpart to
+// SendPromptWithSystem. An empty system string is omitted from the request.
+func (a *AnthropicProvider) SendPromptWithFileAndSystem(modelName string, system string, prompt string, file FileInput) (string, error) {
 	a.debugf("Preparing to send prompt with file to model: %s", modelName)
 	a.debugf("File path: %s", file.Path)
+	if system != "" {
+		a.debugf("System prompt length: %d characters", len(system))
+	}
 
 	if a.apiKey == "" {
 		return "", fmt.Errorf("Anthropic provider not configured: missing API key")
@@ -289,6 +310,7 @@ func (a *AnthropicProvider) SendPromptWithFile(modelName string, prompt string, 
 			},
 		},
 		MaxTokens: a.config.MaxTokens,
+		System:    system,
 	}
 
 	// Claude 4+ models only support either temperature OR top_p, not both

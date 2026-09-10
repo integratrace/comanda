@@ -49,6 +49,22 @@ type Provider interface {
 	SetVerbose(verbose bool)
 }
 
+// SystemPrompter is an optional Provider capability for backends that accept a
+// system prompt separate from the user prompt. Standard steps use it when
+// StepConfig.Instructions is set; providers that do not implement it fall back
+// to the plain SendPrompt/SendPromptWithFile calls.
+type SystemPrompter interface {
+	SendPromptWithSystem(modelName string, system string, prompt string) (string, error)
+	SendPromptWithFileAndSystem(modelName string, system string, prompt string, file FileInput) (string, error)
+}
+
+// ModelConfigurer is an optional Provider capability for backends that accept
+// per-call generation settings. Standard steps apply it when a step sets
+// temperature, max_output_tokens, or top_p.
+type ModelConfigurer interface {
+	SetConfig(config ModelConfig)
+}
+
 // ResponsesStreamHandler defines callbacks for streaming responses
 type ResponsesStreamHandler interface {
 	OnResponseCreated(response map[string]interface{})

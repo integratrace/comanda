@@ -1670,7 +1670,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	}
 
 	p.debugf("Executing actions: models=%v actions=%v", modelNames, substitutedActions)
-	actionResult, err := p.processActions(modelNames, substitutedActions)
+	actionResult, err := p.processActions(modelNames, substitutedActions, &step.Config)
 	if err != nil {
 		errMsg := fmt.Sprintf("Action processing failed for step '%s': %v (models=%v actions=%v)",
 			step.Name, err, modelNames, substitutedActions)

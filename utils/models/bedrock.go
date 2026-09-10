@@ -102,8 +102,18 @@ func (b *BedrockProvider) extractModelID(modelName string) string {
 
 // SendPrompt sends a prompt to the specified model and returns the response
 func (b *BedrockProvider) SendPrompt(modelName string, prompt string) (string, error) {
+	return b.SendPromptWithSystem(modelName, "", prompt)
+}
+
+// SendPromptWithSystem sends a prompt with an optional system prompt, which the
+// Converse API takes as a dedicated System block list. An empty system string
+// is omitted from the request.
+func (b *BedrockProvider) SendPromptWithSystem(modelName string, system string, prompt string) (string, error) {
 	b.debugf("Preparing to send prompt to model: %s", modelName)
 	b.debugf("Prompt length: %d characters", len(prompt))
+	if system != "" {
+		b.debugf("System prompt length: %d characters", len(system))
+	}
 
 	if b.client == nil {
 		// Auto-configure if not already done
@@ -139,6 +149,7 @@ func (b *BedrockProvider) SendPrompt(modelName string, prompt string) (string, e
 		ModelId:         aws.String(modelID),
 		Messages:        messages,
 		InferenceConfig: inferenceConfig,
+		System:          systemContentBlocks(system),
 	}
 
 	b.debugf("Calling Bedrock Converse API")
@@ -154,10 +165,30 @@ func (b *BedrockProvider) SendPrompt(modelName string, prompt string) (string, e
 	return responseText, nil
 }
 
+// systemContentBlocks wraps a system prompt for the Converse API, returning nil
+// for an empty prompt so the field is omitted.
+func systemContentBlocks(system string) []types.SystemContentBlock {
+	if system == "" {
+		return nil
+	}
+	return []types.SystemContentBlock{
+		&types.SystemContentBlockMemberText{Value: system},
+	}
+}
+
 // SendPromptWithFile sends a prompt along with a file to the specified model
 func (b *BedrockProvider) SendPromptWithFile(modelName string, prompt string, file FileInput) (string, error) {
+	return b.SendPromptWithFileAndSystem(modelName, "", prompt, file)
+}
+
+// SendPromptWithFileAndSystem is the file-input counterpart to
+// SendPromptWithSystem. An empty system string is omitted from the request.
+func (b *BedrockProvider) SendPromptWithFileAndSystem(modelName string, system string, prompt string, file FileInput) (string, error) {
 	b.debugf("Preparing to send prompt with file to model: %s", modelName)
 	b.debugf("File path: %s, MIME type: %s", file.Path, file.MimeType)
+	if system != "" {
+		b.debugf("System prompt length: %d characters", len(system))
+	}
 
 	if b.client == nil {
 		if err := b.Configure(""); err != nil {
@@ -242,6 +273,7 @@ func (b *BedrockProvider) SendPromptWithFile(modelName string, prompt string, fi
 		ModelId:         aws.String(modelID),
 		Messages:        messages,
 		InferenceConfig: inferenceConfig,
+		System:          systemContentBlocks(system),
 	}
 
 	output, err := b.client.Converse(context.Background(), input)
