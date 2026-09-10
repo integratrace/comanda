@@ -134,8 +134,17 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 	p.debugf("Validating %d model(s)", len(modelNames))
 	for _, modelName := range modelNames {
 		p.debugf("Starting validation for model: %s", modelName)
-		p.debugf("Attempting provider detection for model: %s", modelName)
 		resolvedModelName := p.resolveModelTarget(modelName)
+
+		// A provider pre-registered via SetProvider is already configured;
+		// skip DetectProvider/envConfig resolution entirely when it supports
+		// this model.
+		if preConfigured := p.preConfiguredProviderFor(resolvedModelName); preConfigured != nil {
+			p.debugf("Model %s handled by pre-configured provider %s (SetProvider)", modelName, preConfigured.Name())
+			continue
+		}
+
+		p.debugf("Attempting provider detection for model: %s", modelName)
 		provider := models.DetectProvider(resolvedModelName)
 		p.debugf("Provider detection result for %s: found=%v", modelName, provider != nil)
 		if provider == nil {
@@ -335,6 +344,19 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 	return nil
 }
 
+// preConfiguredProviderFor returns the provider registered via SetProvider
+// that supports modelName, or nil if none was registered.
+func (p *Processor) preConfiguredProviderFor(modelName string) models.Provider {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for name := range p.preConfiguredNames {
+		if provider, ok := p.providers[name]; ok && provider.SupportsModel(modelName) {
+			return provider
+		}
+	}
+	return nil
+}
+
 // localProviders lists providers that use local binaries and don't require API keys.
 // Add new local provider names here as needed.
 var localProviders = map[string]bool{
@@ -365,6 +387,12 @@ func (p *Processor) configureProviders() error {
 
 	for providerName, provider := range providersCopy {
 		p.debugf("Configuring provider %s", providerName)
+
+		// Providers injected via SetProvider are already configured by the caller
+		if p.preConfiguredNames[providerName] {
+			p.debugf("Skipping envConfig setup for pre-configured provider %s", providerName)
+			continue
+		}
 
 		// Handle local providers (no API key needed, use "LOCAL" configuration)
 		if isLocalProvider(providerName) {

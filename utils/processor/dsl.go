@@ -62,6 +62,7 @@ type Processor struct {
 	worktreeHandler      *WorktreeHandler   // Handler for Git worktrees (parallel Claude Code execution)
 	currentStepWorktree  string             // Current step's worktree name (if any)
 	workflowFile         string             // Workflow file that created this processor, for loop state/checksums
+	preConfiguredNames   map[string]bool    // Provider names injected via SetProvider; skip envConfig-based setup
 }
 
 // SetSourceRoot binds this processor to a stable project source tree. Runtime
@@ -2340,11 +2341,29 @@ func (p *Processor) handleDeferredStep() error {
 	return nil
 }
 
+// SetProvider pre-registers an already-configured models.Provider, letting
+// embedders (library callers) supply a provider that bypasses envConfig
+// entirely. validateModel, configureProviders, and getProviderForModel all
+// treat providers registered this way as already configured.
+func (p *Processor) SetProvider(pr models.Provider) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.providers == nil {
+		p.providers = make(map[string]models.Provider)
+	}
+	if p.preConfiguredNames == nil {
+		p.preConfiguredNames = make(map[string]bool)
+	}
+	p.providers[pr.Name()] = pr
+	p.preConfiguredNames[pr.Name()] = true
+}
+
 // getProviderForModel retrieves a model provider based on the model name
 func (p *Processor) getProviderForModel(modelName string) (models.Provider, error) {
 	resolvedModelName := p.resolveModelTarget(modelName)
 
-	// First, check if the provider is already initialized
+	// First, check if the provider is already initialized (also covers
+	// providers pre-registered via SetProvider)
 	for _, provider := range p.providers {
 		if provider.SupportsModel(resolvedModelName) {
 			return provider, nil

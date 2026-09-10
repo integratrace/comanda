@@ -59,16 +59,21 @@ func (p *Processor) processActions(modelNames []string, actions []string) (*Acti
 		}, nil
 	}
 
-	// Get provider by detecting it from the model name
-	provider := models.DetectProvider(resolvedModelName)
-	if provider == nil {
-		return nil, fmt.Errorf("provider not found for model: %s", modelName)
-	}
-
-	// Use the configured provider instance
-	configuredProvider := p.providers[provider.Name()]
+	// A provider injected via SetProvider wins over model-name detection, so
+	// embedders can serve models DetectProvider knows nothing about.
+	configuredProvider := p.preConfiguredProviderFor(resolvedModelName)
 	if configuredProvider == nil {
-		return nil, fmt.Errorf("provider %s not configured", provider.Name())
+		// Get provider by detecting it from the model name
+		provider := models.DetectProvider(resolvedModelName)
+		if provider == nil {
+			return nil, fmt.Errorf("provider not found for model: %s", modelName)
+		}
+
+		// Use the configured provider instance
+		configuredProvider = p.providers[provider.Name()]
+		if configuredProvider == nil {
+			return nil, fmt.Errorf("provider %s not configured", provider.Name())
+		}
 	}
 
 	p.debugf("Using model %s (resolved to %s) with provider %s", modelName, resolvedModelName, configuredProvider.Name())
