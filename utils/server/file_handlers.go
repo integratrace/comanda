@@ -46,7 +46,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	config.VerboseLog("Listing files in directory: %s", dirPath)
-	
+
 	// Validate and resolve the path
 	var fullPath string
 	if dirPath == "/" {
@@ -67,7 +67,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		config.DebugLog("Listing directory: %s", fullPath)
-		
+
 		// Verify the path exists and is a directory
 		fileInfo, err := os.Stat(fullPath)
 		if err != nil {
@@ -88,7 +88,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		
+
 		// Ensure the path is a directory
 		if !fileInfo.IsDir() {
 			config.VerboseLog("Path is not a directory: %s", fullPath)
@@ -134,7 +134,7 @@ func (s *Server) listFilesWithMetadata(dir string) ([]FileInfo, error) {
 	for _, entry := range entries {
 		// Get full path for the entry
 		path := filepath.Join(dir, entry.Name())
-		
+
 		// Get detailed file info
 		info, err := entry.Info()
 		if err != nil {
@@ -761,9 +761,11 @@ func (s *Server) handleYAMLProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// First unmarshal into a map to preserve step names
-	var rawConfig map[string]processor.StepConfig
-	if err := yaml.Unmarshal([]byte(req.Content), &rawConfig); err != nil {
+	// Unmarshal using the DSLConfig custom unmarshaler (same as CLI) so that
+	// ordered steps and top-level blocks (parallel, agentic-loop, loops,
+	// execute_loops, defer, workflow) are all handled correctly
+	var dslConfig processor.DSLConfig
+	if err := yaml.Unmarshal([]byte(req.Content), &dslConfig); err != nil {
 		if req.Streaming {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -791,20 +793,17 @@ func (s *Server) handleYAMLProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert map to ordered Steps slice
-	var dslConfig processor.DSLConfig
-	for name, config := range rawConfig {
-		dslConfig.Steps = append(dslConfig.Steps, processor.Step{
-			Name:   name,
-			Config: config,
-		})
-	}
-
 	// Get runtime directory from query parameter
 	runtimeDir := r.URL.Query().Get("runtimeDir")
 
 	// Create processor instance with validation enabled and runtime directory
 	proc := processor.NewProcessor(&dslConfig, s.envConfig, s.config, true, runtimeDir)
+	if sourceRoot, err := projectSourceRoot(s.envConfig, r.URL.Query().Get("project")); err != nil {
+		sendJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	} else if sourceRoot != "" {
+		proc.SetSourceRoot(sourceRoot)
+	}
 
 	// Set input if provided
 	if req.Input != "" {
@@ -847,6 +846,22 @@ func (s *Server) handleYAMLProcess(w http.ResponseWriter, r *http.Request) {
 		// Set up processor with progress writer
 		proc.SetProgressWriter(progressWriter)
 
+		// Forward stream log lines (loop iterations, context usage, tool
+		// activity) through the progress channel as structured log events
+		proc.SetStreamLogCallback(func(line string) {
+			progressWriter.WriteProgress(processor.ProgressUpdate{
+				Type:    processor.ProgressLog,
+				Message: line,
+			})
+		})
+
+		// Long-running workflows can stream for a long time; clear the
+		// server's write deadline for this response
+		rc := http.NewResponseController(w)
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+			config.DebugLog("Could not clear write deadline for streaming: %v", err)
+		}
+
 		// Run the processor in a goroutine
 		processDone := make(chan error)
 		go func() {
@@ -875,7 +890,14 @@ func (s *Server) handleYAMLProcess(w http.ResponseWriter, r *http.Request) {
 				case processor.ProgressSpinner:
 					sseWriter.SendSpinner(update.Message)
 				case processor.ProgressStep:
-					sseWriter.SendProgress(update.Message)
+					// For initial and completion messages, send as plain text
+					if update.Message == "Starting workflow processing" || update.Message == "Workflow processing completed successfully" || update.Step == nil && update.PerformanceMetrics == nil {
+						sseWriter.SendProgress(update.Message)
+					} else {
+						sseWriter.SendProgress(buildProgressPayload(update))
+					}
+				case processor.ProgressLog:
+					sseWriter.SendLog(update.Message)
 				case processor.ProgressComplete:
 					sseWriter.SendComplete(update.Message)
 				case processor.ProgressError:

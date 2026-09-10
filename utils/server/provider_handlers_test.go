@@ -4,10 +4,22 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/kris-hansen/comanda/utils/config"
+	"github.com/kris-hansen/comanda/utils/models"
 )
+
+func setTestComandaEnv(t *testing.T, envConfig *config.EnvConfig) {
+	t.Helper()
+
+	envPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.SaveEnvConfig(envPath, envConfig); err != nil {
+		t.Fatalf("Failed to save test config: %v", err)
+	}
+	t.Setenv("COMANDA_ENV", envPath)
+}
 
 func TestHandleDeleteProvider(t *testing.T) {
 	// Create test configuration
@@ -27,6 +39,7 @@ func TestHandleDeleteProvider(t *testing.T) {
 			},
 		},
 	}
+	setTestComandaEnv(t, testConfig)
 
 	// Create server instance
 	server := &Server{
@@ -152,6 +165,7 @@ func TestProviderRouteHandling(t *testing.T) {
 			},
 		},
 	}
+	setTestComandaEnv(t, testConfig)
 
 	// Create server instance
 	server := &Server{
@@ -236,5 +250,76 @@ func TestProviderRouteHandling(t *testing.T) {
 			}
 			// No need to check success response body for these tests yet
 		})
+	}
+}
+
+func TestHandleGetProvidersIncludesCLIAgents(t *testing.T) {
+	// Create test configuration with both an API provider and a CLI agent provider.
+	testConfig := &config.EnvConfig{
+		Providers: map[string]*config.Provider{
+			"openai": {
+				APIKey: "test-key",
+				Models: []config.Model{
+					{Name: "gpt-4", Modes: []config.ModelMode{config.TextMode}},
+				},
+			},
+			"kimi-code": {
+				APIKey: "",
+				Models: []config.Model{
+					{Name: "kimi-code", Type: "external", Modes: []config.ModelMode{config.TextMode, config.VisionMode, config.MultiMode, config.FileMode}},
+				},
+			},
+		},
+	}
+	setTestComandaEnv(t, testConfig)
+
+	server := &Server{
+		mux: http.NewServeMux(),
+		config: &config.ServerConfig{
+			BearerToken: "test-token",
+			Enabled:     true,
+		},
+		envConfig: testConfig,
+	}
+	server.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/providers", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status code %d, got %d. Body: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var response ProviderListResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v. Body: %s", err, rec.Body.String())
+	}
+	if !response.Success {
+		t.Fatalf("Expected success response, got error: %s", response.Error)
+	}
+
+	providerNames := make(map[string]bool)
+	for _, p := range response.Providers {
+		providerNames[p.Name] = true
+	}
+
+	// API provider should be present.
+	if !providerNames["openai"] {
+		t.Errorf("Expected 'openai' provider in response")
+	}
+
+	// The configured CLI agent provider should be present.
+	if !providerNames["kimi-code"] {
+		t.Errorf("Expected 'kimi-code' provider in response")
+	}
+
+	// Auto-detected CLI agents that are installed should also be present.
+	if models.IsClaudeCodeAvailable() && !providerNames["claude-code"] {
+		t.Errorf("Expected 'claude-code' provider in response when CLI is available")
+	}
+	if models.IsOpenAICodexAvailable() && !providerNames["openai-codex"] {
+		t.Errorf("Expected 'openai-codex' provider in response when CLI is available")
 	}
 }

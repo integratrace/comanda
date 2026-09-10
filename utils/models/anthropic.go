@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/kris-hansen/comanda/utils/fileutil"
 	"github.com/kris-hansen/comanda/utils/retry"
@@ -18,6 +20,7 @@ type AnthropicProvider struct {
 	apiKey  string
 	config  ModelConfig
 	verbose bool
+	mu      sync.Mutex
 }
 
 // NewAnthropicProvider creates a new Anthropic provider instance
@@ -31,10 +34,12 @@ func NewAnthropicProvider() *AnthropicProvider {
 	}
 }
 
-// debugf prints debug information if verbose mode is enabled
+// debugf prints debug information if verbose mode is enabled (thread-safe)
 func (a *AnthropicProvider) debugf(format string, args ...interface{}) {
 	if a.verbose {
-		fmt.Printf("[DEBUG][Anthropic] "+format+"\n", args...)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		log.Printf("[DEBUG][Anthropic] "+format+"\n", args...)
 	}
 }
 
@@ -84,8 +89,8 @@ type anthropicRequest struct {
 	Model       string             `json:"model"`
 	Messages    []anthropicMessage `json:"messages"`
 	MaxTokens   int                `json:"max_tokens"`
-	Temperature float64            `json:"temperature"`
-	TopP        float64            `json:"top_p"`
+	Temperature float64            `json:"temperature,omitempty"`
+	TopP        float64            `json:"top_p,omitempty"`
 }
 
 type anthropicResponse struct {
@@ -128,10 +133,12 @@ func (a *AnthropicProvider) SendPrompt(modelName string, prompt string) (string,
 				},
 			},
 		},
-		MaxTokens:   a.config.MaxTokens,
-		Temperature: a.config.Temperature,
-		TopP:        a.config.TopP,
+		MaxTokens: a.config.MaxTokens,
 	}
+
+	// Claude 4+ models only support either temperature OR top_p, not both
+	// Prefer temperature over top_p
+	reqBody.Temperature = a.config.Temperature
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -281,10 +288,12 @@ func (a *AnthropicProvider) SendPromptWithFile(modelName string, prompt string, 
 				Content: content,
 			},
 		},
-		MaxTokens:   a.config.MaxTokens,
-		Temperature: a.config.Temperature,
-		TopP:        a.config.TopP,
+		MaxTokens: a.config.MaxTokens,
 	}
+
+	// Claude 4+ models only support either temperature OR top_p, not both
+	// Prefer temperature over top_p
+	reqBody.Temperature = a.config.Temperature
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -397,4 +406,90 @@ func (a *AnthropicProvider) GetConfig() ModelConfig {
 // SetVerbose enables or disables verbose mode
 func (a *AnthropicProvider) SetVerbose(verbose bool) {
 	a.verbose = verbose
+}
+
+// AnthropicModel represents a model from the Anthropic API
+type AnthropicModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+	Type        string `json:"type"`
+}
+
+// AnthropicModelsResponse represents the response from the models API
+type AnthropicModelsResponse struct {
+	Data    []AnthropicModel `json:"data"`
+	HasMore bool             `json:"has_more"`
+	FirstID string           `json:"first_id"`
+	LastID  string           `json:"last_id"`
+}
+
+// ListModels fetches the list of available models from the Anthropic API
+func (a *AnthropicProvider) ListModels() ([]string, error) {
+	a.debugf("Fetching models from Anthropic API")
+
+	if a.apiKey == "" {
+		return nil, fmt.Errorf("API key is required to list models")
+	}
+
+	var allModels []string
+	afterID := ""
+
+	for {
+		url := "https://api.anthropic.com/v1/models?limit=100"
+		if afterID != "" {
+			url += "&after_id=" + afterID
+		}
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %v", err)
+		}
+
+		req.Header.Set("x-api-key", a.apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %v", err)
+		}
+
+		var response AnthropicModelsResponse
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal response: %v", err)
+		}
+
+		for _, model := range response.Data {
+			allModels = append(allModels, model.ID)
+		}
+
+		if !response.HasMore {
+			break
+		}
+		afterID = response.LastID
+	}
+
+	a.debugf("Found %d models from Anthropic API", len(allModels))
+	return allModels, nil
+}
+
+// ListModelsWithAPIKey fetches models using a specific API key (static method)
+func ListAnthropicModels(apiKey string) ([]string, error) {
+	provider := NewAnthropicProvider()
+	if err := provider.Configure(apiKey); err != nil {
+		return nil, err
+	}
+	return provider.ListModels()
 }

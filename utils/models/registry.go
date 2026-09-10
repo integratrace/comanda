@@ -34,46 +34,84 @@ func NewModelRegistry() *ModelRegistry {
 func (r *ModelRegistry) initializeDefaultModels() {
 	// Anthropic models
 	r.RegisterModels("anthropic", []string{
-		"claude-3-5-sonnet-20241022",
-		"claude-3-5-sonnet-latest",
-		"claude-3-5-haiku-latest",
-		"claude-3-7-sonnet-20250219",
-		"claude-3-7-sonnet-latest",
-		"claude-3-5-haiku-20241022",
+		// Claude 4.5 series (latest)
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-5",
+		"claude-haiku-4-5-20251001",
+		"claude-haiku-4-5",
+		"claude-opus-4-5-20251101",
+		"claude-opus-4-5",
+		// Claude 4.x series
+		"claude-opus-4-1-20250805",
+		"claude-opus-4-1",
 		"claude-opus-4-20250514",
 		"claude-sonnet-4-20250514",
+		// Claude 3.7 series
+		"claude-3-7-sonnet-20250219",
+		"claude-3-7-sonnet-latest",
+		// Claude 3.5 series (legacy)
+		"claude-3-5-sonnet-20241022",
+		"claude-3-5-sonnet-latest",
+		"claude-3-5-haiku-20241022",
+		"claude-3-5-haiku-latest",
 	})
 	r.RegisterFamilies("anthropic", []string{
-		"claude-3-5-sonnet",
-		"claude-3-5-haiku",
-		"claude-3-7-sonnet",
+		"claude-opus-4-5",
+		"claude-sonnet-4-5",
+		"claude-haiku-4-5",
+		"claude-opus-4-1",
 		"claude-opus-4",
 		"claude-sonnet-4",
+		"claude-3-7-sonnet",
+		"claude-3-5-sonnet",
+		"claude-3-5-haiku",
 	})
 
 	// OpenAI models - primary models only, the full list is fetched from the API
 	r.RegisterModels("openai", []string{
-		"gpt-4o",
-		"gpt-4o-audio-preview",
-		"o1",
-		"o3-mini",
-		"o1-pro",
-		"o4-mini",
-		"gpt-4.1",
-		"o3-pro",
-		"o3",
-		"chatgpt-4o-latest",
+		// GPT-5.6 series (latest)
+		"gpt-5.6",
+		"gpt-5.6-sol",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
+		// Previous GPT-5 series
+		"gpt-5.1",
+		"gpt-5.1-mini",
+		"gpt-5.1-nano",
 		"gpt-5",
 		"gpt-5-mini",
 		"gpt-5-nano",
+		// GPT-4.1 series
+		"gpt-4.1",
+		// GPT-4o series
+		"gpt-4o",
+		"gpt-4o-audio-preview",
+		"chatgpt-4o-latest",
+		// o-series reasoning models
+		"o3-pro",
+		"o3",
+		"o3-mini",
+		"o1-pro",
+		"o1",
+		"o4-mini",
 	})
 
 	// X.AI models
 	r.RegisterModels("xai", []string{
+		// Current Grok models
+		"grok-4.5",
+		"grok-4.5-latest",
+		"grok-4.3",
+		"grok-4.3-latest",
+		"grok-latest",
+		// Previous Grok models retained for compatibility
 		"grok-beta",
 		"grok-vision-beta",
 		"grok-4",
 		"grok-4-heavy",
+	})
+	r.RegisterFamilies("xai", []string{
+		"grok-",
 	})
 
 	// Deepseek models
@@ -86,17 +124,22 @@ func (r *ModelRegistry) initializeDefaultModels() {
 
 	// Google models
 	r.RegisterModels("google", []string{
+		// Gemini 3 series (latest)
+		"gemini-3-pro-preview",
+		// Gemini 2.5 series
 		"gemini-2.5-pro",
 		"gemini-2.5-flash",
 		"gemini-2.5-flash-lite",
+		// Gemini 1.5 series (legacy)
 		"gemini-1.5-flash",
 		"gemini-1.5-pro",
 		"gemini-1.0-pro",
 		"aqa",
 	})
 	r.RegisterFamilies("google", []string{
-		"gemini-1.5",
+		"gemini-3",
 		"gemini-2.5",
+		"gemini-1.5",
 	})
 
 	// Moonshot models
@@ -108,6 +151,83 @@ func (r *ModelRegistry) initializeDefaultModels() {
 	})
 	r.RegisterFamilies("moonshot", []string{
 		"moonshot-",
+	})
+
+	// Sakana Fugu models
+	r.RegisterModels("sakana", []string{
+		"fugu",
+		"fugu-ultra",
+	})
+	r.RegisterFamilies("sakana", []string{
+		"fugu-",
+	})
+
+	// Claude Code models (local CLI)
+	r.RegisterModels("claude-code", []string{
+		"claude-code",
+		"claude-code-opus",
+		"claude-code-sonnet",
+		"claude-code-haiku",
+	})
+	r.RegisterFamilies("claude-code", []string{
+		"claude-code",
+	})
+
+	// Gemini CLI models (local CLI)
+	r.RegisterModels("gemini-cli", []string{
+		"gemini-cli",
+		"gemini-cli-pro",
+		"gemini-cli-flash",
+		"gemini-cli-flash-lite",
+	})
+	r.RegisterFamilies("gemini-cli", []string{
+		"gemini-cli",
+	})
+
+	// OpenAI Codex models are discovered from the locally authenticated CLI.
+	r.RegisterModels("openai-codex", GetOpenAICodexModels())
+	r.RegisterFamilies("openai-codex", []string{
+		"openai-codex",
+	})
+
+	// Kimi Code models (local CLI). The kimi-code-<alias> family covers
+	// user-defined model aliases from ~/.kimi-code/config.toml.
+	r.RegisterModels("kimi-code", []string{
+		"kimi-code",
+	})
+	r.RegisterFamilies("kimi-code", []string{
+		"kimi-code",
+	})
+
+	// AWS Bedrock models (via Converse API)
+	// Use bedrock/ prefix to explicitly route to Bedrock
+	r.RegisterModels("bedrock", []string{
+		// Anthropic Claude models on Bedrock
+		"bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+		"bedrock/anthropic.claude-3-5-haiku-20241022-v1:0",
+		"bedrock/anthropic.claude-3-opus-20240229-v1:0",
+		"bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+		"bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+		"bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+		"bedrock/us.anthropic.claude-3-5-haiku-20241022-v1:0",
+		"bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0",
+		// Amazon Nova models
+		"bedrock/us.amazon.nova-pro-v1:0",
+		"bedrock/us.amazon.nova-lite-v1:0",
+		"bedrock/us.amazon.nova-micro-v1:0",
+		// Meta Llama models
+		"bedrock/us.meta.llama3-2-90b-instruct-v1:0",
+		"bedrock/us.meta.llama3-2-11b-instruct-v1:0",
+		"bedrock/us.meta.llama3-2-3b-instruct-v1:0",
+		"bedrock/us.meta.llama3-2-1b-instruct-v1:0",
+	})
+	r.RegisterFamilies("bedrock", []string{
+		"bedrock/anthropic.claude",
+		"bedrock/us.anthropic.claude",
+		"bedrock/us.amazon.nova",
+		"bedrock/amazon.nova",
+		"bedrock/us.meta.llama",
+		"bedrock/meta.llama",
 	})
 }
 

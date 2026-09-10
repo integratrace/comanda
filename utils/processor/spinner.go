@@ -2,14 +2,18 @@ package processor
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type Spinner struct {
 	chars    []string
 	index    int
 	message  string
+	detail   string
 	stop     chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
@@ -20,7 +24,7 @@ type Spinner struct {
 
 func NewSpinner() *Spinner {
 	return &Spinner{
-		chars: []string{"|", "/", "-", "\\"},
+		chars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		stop:  make(chan struct{}),
 	}
 }
@@ -49,6 +53,7 @@ func (s *Spinner) Start(message string) {
 		s.stopped = false
 	}
 	s.message = message
+	s.detail = ""
 	s.mu.Unlock()
 
 	// Send initial progress update
@@ -62,27 +67,42 @@ func (s *Spinner) Start(message string) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		// Hide cursor during spinner animation (only if stdout is a terminal)
+		isTTY := term.IsTerminal(int(os.Stdout.Fd()))
+		if isTTY {
+			fmt.Print("\033[?25l")
+		}
 		for {
 			select {
 			case <-s.stop:
 				s.mu.Lock()
 				msg := fmt.Sprintf("%s... Done!", s.message)
-				if !s.disabled {
+				disabled := s.disabled
+				progress := s.progress
+				s.mu.Unlock()
+
+				if !disabled {
 					fmt.Printf("\r%s     \n", msg)
 				}
+				// Show cursor again (only if stdout is a terminal)
+				if isTTY {
+					fmt.Print("\033[?25h")
+				}
 				// Send completion update
-				if s.progress != nil {
-					s.progress.WriteProgress(ProgressUpdate{
+				if progress != nil {
+					progress.WriteProgress(ProgressUpdate{
 						Type:    ProgressStep,
 						Message: msg,
 					})
 				}
-				s.mu.Unlock()
 				return
 			default:
 				s.mu.Lock()
 				if !s.disabled {
 					spinMsg := fmt.Sprintf("%s... %s", s.message, s.chars[s.index])
+					if s.detail != "" {
+						spinMsg += fmt.Sprintf("  ·  %s", s.detail)
+					}
 					fmt.Printf("\r%s", spinMsg)
 					// Don't send spinner updates through progress writer
 					s.index = (s.index + 1) % len(s.chars)
@@ -92,6 +112,16 @@ func (s *Spinner) Start(message string) {
 			}
 		}
 	}()
+}
+
+// SetProgress updates the live spinner label and optional detail. Commands
+// with long deterministic work can show both a phase and the file or object
+// currently being processed without starting a second UI.
+func (s *Spinner) SetProgress(message, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.message = message
+	s.detail = detail
 }
 
 func (s *Spinner) Stop() {

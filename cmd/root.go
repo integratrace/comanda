@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kris-hansen/comanda/utils/config"    // Required for input.Input
 	"github.com/kris-hansen/comanda/utils/models"    // Required for models.DetectProvider
@@ -19,16 +21,57 @@ var version string
 var verbose bool
 var debug bool
 var generateModelName string // Flag for specifying model in generateCmd
+var improveModelName string  // Flag for specifying model in improveCmd
 
 // envConfig holds the loaded environment configuration, available to all commands
 var envConfig *config.EnvConfig
 
+// logFile holds the log file handle for proper cleanup
+var logFile *os.File
+
 var rootCmd = &cobra.Command{
 	Use:   "comanda",
-	Short: "A workflow processor for handling model interactions",
-	Long: `comanda is a command line tool that processes workflow configurations
-for model interactions and executes the specified actions.`,
+	Short: "A workflow automation tool for orchestrating LLM interactions",
+	Long: `Comanda is a workflow automation tool that orchestrates LLM interactions
+through YAML-defined pipelines.
+
+Getting Started:
+  1. comanda configure        Set up your API keys and models
+  2. comanda generate         Create a workflow from natural language
+  3. comanda improve          Improve an existing workflow with feedback
+  4. comanda process          Execute a workflow
+
+Configuration is stored in ~/.comanda/config.yaml (legacy .env also supported)
+For documentation, visit: https://github.com/kris-hansen/comanda`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Configure log output format - remove timestamps for cleaner CLI output
+		// Server mode sets its own log flags with timestamps
+		log.SetFlags(0)
+
+		// Optional: Set up file-based logging for debugging sessions
+		// This preserves logs even after the session ends
+		if logFileName := os.Getenv("COMANDA_LOG_FILE"); logFileName != "" {
+			if file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
+				logFile = file // Store for cleanup
+				log.SetOutput(file)
+				log.Printf("[INFO] Logging session started at %s\n", time.Now().Format(time.RFC3339))
+			} else {
+				// Fallback: warn user but continue with stdout logging
+				log.Printf("[WARN] Failed to open log file '%s': %v. Continuing with stdout logging.\n", logFileName, err)
+			}
+		}
+
+		// Ensure log file is properly closed on application exit (outside conditional)
+		defer func() {
+			if logFile != nil {
+				log.Printf("[INFO] Logging session ended at %s\n", time.Now().Format(time.RFC3339))
+				if err := logFile.Sync(); err != nil {
+					log.Printf("[WARN] Failed to sync log file: %v\n", err)
+				}
+				logFile.Close()
+			}
+		}()
+
 		// Set global verbose and debug flags
 		config.Verbose = verbose
 		config.Debug = debug
@@ -36,7 +79,7 @@ for model interactions and executes the specified actions.`,
 		// Get environment file path from COMANDA_ENV or default
 		envPath := config.GetEnvPath()
 		if verbose {
-			fmt.Printf("[DEBUG] Loading environment configuration from %s\n", envPath)
+			log.Printf("[DEBUG] Loading environment configuration from %s\n", envPath)
 		}
 
 		// Load environment configuration
@@ -47,7 +90,7 @@ for model interactions and executes the specified actions.`,
 		}
 
 		if verbose {
-			fmt.Println("[DEBUG] Environment configuration loaded successfully")
+			log.Println("[DEBUG] Environment configuration loaded successfully")
 		}
 
 		return nil
@@ -58,20 +101,34 @@ for model interactions and executes the specified actions.`,
 }
 
 var generateCmd = &cobra.Command{
-	Use:   "generate <output_filename.yaml> \"<prompt_for_workflow_generation>\"",
-	Short: "Generate a new Comanda workflow YAML file using an LLM",
-	Long: `Generates a new Comanda workflow YAML file based on a natural language prompt.
-The generated workflow is saved to the specified output filename.
-You can optionally specify a model to use for generation, otherwise the default_generation_model from your configuration will be used.`,
+	Use:   "generate <output.yaml> \"<prompt>\"",
+	Short: "Create a workflow from natural language",
+	Long: `Generate a new Comanda workflow YAML file from a natural language description.
+
+The LLM will create a valid workflow based on your prompt and save it to the
+specified file. Uses default_generation_model from your config unless
+overridden with --model.`,
+	Example: `  # Generate a summarization workflow
+  comanda generate summarize.yaml "Create a workflow that summarizes text input"
+
+  # Generate with a specific model
+  comanda generate analyze.yaml "Analyze sentiment of text" -m claude-code
+
+  # Generate a multi-step workflow
+  comanda generate pipeline.yaml "Extract key points, translate to Spanish, format as bullets"`,
 	Args: func(cmd *cobra.Command, args []string) error {
 		if len(args) != 2 {
-			return fmt.Errorf("requires exactly two arguments: <output_filename.yaml> and \"<prompt_for_workflow_generation>\"\nExample: comanda generate my_workflow.yaml \"Create a workflow to summarize a file and save it.\"")
+			return fmt.Errorf("requires two arguments: <output.yaml> and \"<prompt>\"")
 		}
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		outputFilename := args[0]
 		userPrompt := args[1]
+
+		// If .comanda/ exists and user provided a plain filename (no path),
+		// save workflows there to keep project root clean
+		outputFilename = resolveOutputPath(outputFilename)
 
 		// Use the centralized configuration that was loaded in PersistentPreRunE
 		// No need to load it again
@@ -81,17 +138,465 @@ You can optionally specify a model to use for generation, otherwise the default_
 			modelForGeneration = envConfig.DefaultGenerationModel
 		}
 		if modelForGeneration == "" {
-			return fmt.Errorf("no model specified for generation and no default_generation_model configured. Use --model or configure a default")
+			// Build a helpful error message suggesting available options
+			var suggestions []string
+			if models.IsClaudeCodeAvailable() {
+				suggestions = append(suggestions, "claude-code")
+			}
+			if models.IsGeminiCLIAvailable() {
+				suggestions = append(suggestions, "gemini-cli")
+			}
+			if models.IsOpenAICodexAvailable() {
+				suggestions = append(suggestions, "openai-codex")
+			}
+			if models.IsKimiCodeAvailable() {
+				suggestions = append(suggestions, "kimi-code")
+			}
+
+			errMsg := "no model specified for generation and no default_generation_model configured"
+			if len(suggestions) > 0 {
+				errMsg += fmt.Sprintf("\n\nAvailable CLI agents detected: %s", strings.Join(suggestions, ", "))
+				errMsg += fmt.Sprintf("\n\nUse --model to specify one, e.g.:\n  comanda generate output.yaml \"your prompt\" --model %s", suggestions[0])
+				errMsg += "\n\nOr set a default with:\n  comanda configure --set-default-generation-model " + suggestions[0]
+			} else {
+				errMsg += "\n\nUse --model to specify a model or configure a default with:\n  comanda configure --default"
+			}
+			return fmt.Errorf("%s", errMsg)
 		}
 
-		fmt.Printf("Generating workflow using model: %s\n", modelForGeneration)
-		fmt.Printf("Output file: %s\n", outputFilename)
+		log.Printf("Generating workflow using model: %s\n", modelForGeneration)
+		log.Printf("Output file: %s\n", outputFilename)
 
-		// Prepare the full prompt for the LLM
-		// Use the embedded guide instead of reading from file
-		dslGuide := processor.EmbeddedLLMGuide
+		// Get available models from the environment config
+		// This ensures the LLM only uses models that are actually configured
+		availableModels := envConfig.GetAllConfiguredModels()
 
-		fullPrompt := fmt.Sprintf(`SYSTEM: You are a YAML generator. You MUST output ONLY valid YAML content. No explanations, no markdown, no code blocks, no commentary - just raw YAML.
+		// Add Claude Code models if the claude binary is available
+		if models.IsClaudeCodeAvailable() {
+			claudeCodeModels := []string{"claude-code", "claude-code-opus", "claude-code-sonnet", "claude-code-haiku"}
+			availableModels = append(availableModels, claudeCodeModels...)
+		}
+
+		// Add Gemini CLI models if the gemini binary is available
+		if models.IsGeminiCLIAvailable() {
+			geminiCLIModels := []string{"gemini-cli", "gemini-cli-pro", "gemini-cli-flash", "gemini-cli-flash-lite"}
+			availableModels = append(availableModels, geminiCLIModels...)
+		}
+
+		// Add OpenAI Codex models if the codex binary is available
+		if models.IsOpenAICodexAvailable() {
+			availableModels = append(availableModels, models.GetOpenAICodexModels()...)
+		}
+
+		// Add Kimi Code models if the kimi binary is available
+		if models.IsKimiCodeAvailable() {
+			kimiCodeModels := []string{"kimi-code"}
+			availableModels = append(availableModels, kimiCodeModels...)
+		}
+
+		dslGuide := processor.GetGenerationGuideWithModels(availableModels, userPrompt)
+
+		resolvedGenerationModel := modelForGeneration
+		if envConfig != nil {
+			if _, configuredModel, err := envConfig.ResolveConfiguredModel(modelForGeneration); err == nil && configuredModel != nil && configuredModel.Target != "" {
+				resolvedGenerationModel = configuredModel.Target
+			}
+		}
+
+		// Get the provider
+		provider := models.DetectProvider(resolvedGenerationModel)
+		if provider == nil {
+			return fmt.Errorf("could not detect provider for model: %s", modelForGeneration)
+		}
+
+		// Attempt to configure the provider with API key from envConfig
+		// CLI agents don't need configuration from envConfig
+		providerName := provider.Name()
+		isCLIAgent := providerName == "claude-code" || providerName == "gemini-cli" || providerName == "openai-codex" || providerName == "kimi-code"
+
+		providerConfig, err := envConfig.GetProviderConfig(providerName)
+		if err != nil {
+			// Only warn for non-CLI agents that aren't in the config
+			if !isCLIAgent {
+				log.Printf("Warning: Provider %s not found in env configuration. Assuming it does not require an API key or is pre-configured.\n", providerName)
+			}
+		} else {
+			if err := provider.Configure(providerConfig.APIKey); err != nil {
+				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+			}
+		}
+		provider.SetVerbose(verbose)
+
+		// Generate workflow with validation and retry
+		var yamlContent string
+		var invalidModels []string
+		var structureErrors string
+		maxAttempts := 3 // Increased to allow for both model and structure fixes
+
+		// Detect available codebase indexes in .comanda/
+		availableIndexes := detectAvailableIndexes()
+		if verbose && len(availableIndexes) > 0 {
+			log.Printf("[DEBUG] Found %d codebase index(es): %v\n", len(availableIndexes), availableIndexes)
+		}
+
+		// Create spinner for visual feedback during generation
+		spinner := processor.NewSpinner()
+		if verbose {
+			// Disable spinner in verbose mode to avoid interfering with debug output
+			spinner.Disable()
+		}
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			// Build the prompt with any previous validation errors and available indexes
+			prompt := buildGeneratePrompt(dslGuide, userPrompt, invalidModels, structureErrors, availableIndexes)
+
+			// Start spinner for LLM generation
+			spinnerMsg := "Generating workflow"
+			if attempt > 1 {
+				spinnerMsg = fmt.Sprintf("Regenerating workflow (attempt %d/%d)", attempt, maxAttempts)
+			}
+			spinner.Start(spinnerMsg)
+
+			// Call the LLM
+			generatedResponse, err := provider.SendPrompt(resolvedGenerationModel, prompt)
+			spinner.Stop()
+			if err != nil {
+				return fmt.Errorf("LLM execution failed for model '%s': %w", modelForGeneration, err)
+			}
+
+			// Extract YAML content from the response
+			yamlContent = extractYAMLContent(generatedResponse)
+
+			// Reset validation state for this attempt
+			invalidModels = nil
+			structureErrors = ""
+
+			// Validate model names in the generated workflow
+			invalidModels = processor.ValidateWorkflowModels(yamlContent, availableModels)
+
+			// Validate DSL structure
+			validationResult := processor.ValidateWorkflowStructure(yamlContent)
+			if !validationResult.Valid {
+				structureErrors = validationResult.ErrorSummary()
+			}
+
+			// Check if all validations passed
+			if len(invalidModels) == 0 && structureErrors == "" {
+				if verbose {
+					log.Printf("Workflow passed all validations on attempt %d\n", attempt)
+				}
+				break
+			}
+
+			if attempt < maxAttempts {
+				if len(invalidModels) > 0 {
+					log.Printf("Retrying generation due to invalid model(s): %v\n", invalidModels)
+				}
+				if structureErrors != "" {
+					log.Printf("Retrying generation due to DSL structure errors\n")
+					if verbose {
+						log.Printf("Structure errors:\n%s\n", structureErrors)
+					}
+				}
+			} else {
+				// Final attempt - warn but continue
+				if len(invalidModels) > 0 {
+					log.Printf("Warning: Generated workflow contains invalid model(s): %v. These may fail at runtime.\n", invalidModels)
+				}
+				if structureErrors != "" {
+					log.Printf("Warning: Generated workflow has DSL structure errors:\n%s\n", structureErrors)
+				}
+			}
+		}
+
+		// Expand ~ paths in the generated YAML before saving
+		// This ensures agents don't see unexpanded ~ paths which they can't resolve
+		yamlContent = expandPathsInYAML(yamlContent)
+
+		// Save the generated YAML to the output file
+		if err := os.WriteFile(outputFilename, []byte(yamlContent), 0644); err != nil {
+			return fmt.Errorf("failed to write generated workflow to '%s': %w", outputFilename, err)
+		}
+
+		log.Printf("\n%s Workflow successfully generated and saved to %s\n", "\u2705", outputFilename)
+		return nil
+	},
+}
+
+var improveCmd = &cobra.Command{
+	Use:   "improve <file.yaml> \"<feedback>\"",
+	Short: "Improve an existing workflow based on feedback",
+	Long: `Improve an existing Comanda workflow YAML file using natural language feedback.
+
+The LLM will read the current workflow, apply the requested improvements, validate
+the result, and save it. Uses default_generation_model from your config unless
+overridden with --model.`,
+	Example: `  # Break a workflow into more steps
+  comanda improve workflow.yaml "break this into 5 steps instead of 3"
+
+  # Convert workflow type
+  comanda improve workflow.yaml "convert this linear workflow to an agentic loop"
+
+  # Change model
+  comanda improve workflow.yaml "change the model to openai/gpt-4o"
+
+  # Add a step
+  comanda improve workflow.yaml "add a step that checks POLICY.md before the analysis step"`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) != 2 {
+			return fmt.Errorf("requires two arguments: <file.yaml> and \"<feedback>\"")
+		}
+		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		inputFilename := args[0]
+		userFeedback := args[1]
+
+		// Read the existing workflow file
+		existingContent, err := os.ReadFile(inputFilename)
+		if err != nil {
+			return fmt.Errorf("failed to read workflow file '%s': %w", inputFilename, err)
+		}
+
+		modelForGeneration := improveModelName // From flag
+		if modelForGeneration == "" {
+			modelForGeneration = envConfig.DefaultGenerationModel
+		}
+		if modelForGeneration == "" {
+			var suggestions []string
+			if models.IsClaudeCodeAvailable() {
+				suggestions = append(suggestions, "claude-code")
+			}
+			if models.IsGeminiCLIAvailable() {
+				suggestions = append(suggestions, "gemini-cli")
+			}
+			if models.IsOpenAICodexAvailable() {
+				suggestions = append(suggestions, "openai-codex")
+			}
+			if models.IsKimiCodeAvailable() {
+				suggestions = append(suggestions, "kimi-code")
+			}
+
+			errMsg := "no model specified for generation and no default_generation_model configured"
+			if len(suggestions) > 0 {
+				errMsg += fmt.Sprintf("\n\nAvailable CLI agents detected: %s", strings.Join(suggestions, ", "))
+				errMsg += fmt.Sprintf("\n\nUse --model to specify one, e.g.:\n  comanda improve %s \"your feedback\" --model %s", inputFilename, suggestions[0])
+				errMsg += "\n\nOr set a default with:\n  comanda configure --set-default-generation-model " + suggestions[0]
+			} else {
+				errMsg += "\n\nUse --model to specify a model or configure a default with:\n  comanda configure --default"
+			}
+			return fmt.Errorf("%s", errMsg)
+		}
+
+		log.Printf("Improving workflow using model: %s\n", modelForGeneration)
+		log.Printf("Input file: %s\n", inputFilename)
+
+		// Get available models from the environment config
+		availableModels := envConfig.GetAllConfiguredModels()
+
+		if models.IsClaudeCodeAvailable() {
+			claudeCodeModels := []string{"claude-code", "claude-code-opus", "claude-code-sonnet", "claude-code-haiku"}
+			availableModels = append(availableModels, claudeCodeModels...)
+		}
+		if models.IsGeminiCLIAvailable() {
+			geminiCLIModels := []string{"gemini-cli", "gemini-cli-pro", "gemini-cli-flash", "gemini-cli-flash-lite"}
+			availableModels = append(availableModels, geminiCLIModels...)
+		}
+		if models.IsOpenAICodexAvailable() {
+			availableModels = append(availableModels, models.GetOpenAICodexModels()...)
+		}
+		if models.IsKimiCodeAvailable() {
+			kimiCodeModels := []string{"kimi-code"}
+			availableModels = append(availableModels, kimiCodeModels...)
+		}
+
+		dslGuide := processor.GetGenerationGuideWithModels(availableModels, string(existingContent)+"\n"+userFeedback)
+
+		resolvedGenerationModel := modelForGeneration
+		if envConfig != nil {
+			if _, configuredModel, err := envConfig.ResolveConfiguredModel(modelForGeneration); err == nil && configuredModel != nil && configuredModel.Target != "" {
+				resolvedGenerationModel = configuredModel.Target
+			}
+		}
+
+		// Get the provider
+		provider := models.DetectProvider(resolvedGenerationModel)
+		if provider == nil {
+			return fmt.Errorf("could not detect provider for model: %s", modelForGeneration)
+		}
+
+		providerName := provider.Name()
+		isCLIAgent := providerName == "claude-code" || providerName == "gemini-cli" || providerName == "openai-codex" || providerName == "kimi-code"
+
+		providerConfig, err := envConfig.GetProviderConfig(providerName)
+		if err != nil {
+			if !isCLIAgent {
+				log.Printf("Warning: Provider %s not found in env configuration. Assuming it does not require an API key or is pre-configured.\n", providerName)
+			}
+		} else {
+			if err := provider.Configure(providerConfig.APIKey); err != nil {
+				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+			}
+		}
+		provider.SetVerbose(verbose)
+
+		// Improve workflow with validation and retry
+		var yamlContent string
+		var invalidModels []string
+		var structureErrors string
+		maxAttempts := 3
+
+		availableIndexes := detectAvailableIndexes()
+		if verbose && len(availableIndexes) > 0 {
+			log.Printf("[DEBUG] Found %d codebase index(es): %v\n", len(availableIndexes), availableIndexes)
+		}
+
+		spinner := processor.NewSpinner()
+		if verbose {
+			spinner.Disable()
+		}
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			prompt := buildImprovePrompt(dslGuide, string(existingContent), userFeedback, invalidModels, structureErrors, availableIndexes)
+
+			spinnerMsg := "Improving workflow"
+			if attempt > 1 {
+				spinnerMsg = fmt.Sprintf("Re-improving workflow (attempt %d/%d)", attempt, maxAttempts)
+			}
+			spinner.Start(spinnerMsg)
+
+			generatedResponse, err := provider.SendPrompt(resolvedGenerationModel, prompt)
+			spinner.Stop()
+			if err != nil {
+				return fmt.Errorf("LLM execution failed for model '%s': %w", modelForGeneration, err)
+			}
+
+			yamlContent = extractYAMLContent(generatedResponse)
+
+			invalidModels = nil
+			structureErrors = ""
+
+			invalidModels = processor.ValidateWorkflowModels(yamlContent, availableModels)
+
+			validationResult := processor.ValidateWorkflowStructure(yamlContent)
+			if !validationResult.Valid {
+				structureErrors = validationResult.ErrorSummary()
+			}
+
+			if len(invalidModels) == 0 && structureErrors == "" {
+				if verbose {
+					log.Printf("Workflow passed all validations on attempt %d\n", attempt)
+				}
+				break
+			}
+
+			if attempt < maxAttempts {
+				if len(invalidModels) > 0 {
+					log.Printf("Retrying improvement due to invalid model(s): %v\n", invalidModels)
+				}
+				if structureErrors != "" {
+					log.Printf("Retrying improvement due to DSL structure errors\n")
+					if verbose {
+						log.Printf("Structure errors:\n%s\n", structureErrors)
+					}
+				}
+			} else {
+				if len(invalidModels) > 0 {
+					log.Printf("Warning: Improved workflow contains invalid model(s): %v. These may fail at runtime.\n", invalidModels)
+				}
+				if structureErrors != "" {
+					log.Printf("Warning: Improved workflow has DSL structure errors:\n%s\n", structureErrors)
+				}
+			}
+		}
+
+		yamlContent = expandPathsInYAML(yamlContent)
+
+		// Ask user whether to overwrite or save as new file
+		outputFilename := inputFilename
+		fmt.Printf("Overwrite %s? (y/n): ", inputFilename)
+		var answer string
+		_, _ = fmt.Scanln(&answer)
+		answer = strings.TrimSpace(strings.ToLower(answer))
+
+		if answer != "y" && answer != "yes" {
+			fmt.Print("Enter new filename: ")
+			_, _ = fmt.Scanln(&outputFilename)
+			outputFilename = strings.TrimSpace(outputFilename)
+			if outputFilename == "" {
+				return fmt.Errorf("no filename provided, aborting")
+			}
+			// Apply the same output path resolution as generate
+			outputFilename = resolveOutputPath(outputFilename)
+		}
+
+		if err := os.WriteFile(outputFilename, []byte(yamlContent), 0644); err != nil {
+			return fmt.Errorf("failed to write improved workflow to '%s': %w", outputFilename, err)
+		}
+
+		log.Printf("\n%s Workflow successfully improved and saved to %s\n", "\u2705", outputFilename)
+		return nil
+	},
+}
+
+// buildImprovePrompt creates the prompt for workflow improvement
+func buildImprovePrompt(dslGuide, currentWorkflow, userFeedback string, invalidModels []string, structureErrors string, availableIndexes []string) string {
+	basePrompt := fmt.Sprintf(`SYSTEM: You are a YAML workflow improver for the Comanda DSL. You MUST output ONLY valid YAML content. No explanations, no markdown, no code blocks, no commentary - just raw YAML.
+
+--- BEGIN COMANDA DSL SPECIFICATION ---
+%s
+--- END COMANDA DSL SPECIFICATION ---
+
+--- CURRENT WORKFLOW ---
+%s
+--- END CURRENT WORKFLOW ---
+
+The user wants the following improvements:
+%s
+
+Follow the generation contract above. Preserve the current workflow shape unless the user explicitly asks to change it. Output only valid YAML, with no text before or after it.`,
+		dslGuide, currentWorkflow, userFeedback)
+	// Add available codebase indexes if any exist
+	if len(availableIndexes) > 0 {
+		basePrompt += "\n\n--- AVAILABLE CODEBASE INDEXES ---\n"
+		basePrompt += "The following codebase indexes are available in the .comanda/ directory:\n"
+		for _, idx := range availableIndexes {
+			basePrompt += fmt.Sprintf("- %s\n", idx)
+		}
+		basePrompt += "\nTo use a codebase index, reference it as input: .comanda/<index_name>\n"
+		basePrompt += "For agentic workflows, include .comanda in allowed_paths so the agent can read the index.\n"
+		basePrompt += "--- END AVAILABLE INDEXES ---"
+	}
+
+	// Add feedback about previous validation errors
+	if len(invalidModels) > 0 || structureErrors != "" {
+		basePrompt += "\n\n--- VALIDATION ERRORS FROM PREVIOUS ATTEMPT (FIX THESE) ---"
+
+		if len(invalidModels) > 0 {
+			basePrompt += fmt.Sprintf(`
+
+MODEL ERROR: Your previous response used invalid model name(s): %v
+You MUST only use models from the "Supported Models" list in the specification above.`, invalidModels)
+		}
+
+		if structureErrors != "" {
+			basePrompt += fmt.Sprintf(`
+
+STRUCTURE ERRORS:
+%s
+
+Please fix all the above errors and regenerate the workflow.`, structureErrors)
+		}
+
+		basePrompt += "\n--- END VALIDATION ERRORS ---"
+	}
+
+	return basePrompt
+}
+
+// buildGeneratePrompt creates the prompt for workflow generation
+func buildGeneratePrompt(dslGuide, userPrompt string, invalidModels []string, structureErrors string, availableIndexes []string) string {
+	basePrompt := fmt.Sprintf(`SYSTEM: You are a YAML generator. You MUST output ONLY valid YAML content. No explanations, no markdown, no code blocks, no commentary - just raw YAML.
 
 --- BEGIN COMANDA DSL SPECIFICATION ---
 %s
@@ -99,114 +604,192 @@ You can optionally specify a model to use for generation, otherwise the default_
 
 User's request: %s
 
-CRITICAL INSTRUCTION: Your entire response must be valid YAML syntax that can be directly saved to a .yaml file. Do not include ANY text before or after the YAML content. Start your response with the first line of YAML and end with the last line of YAML.`,
-			dslGuide, userPrompt)
+Follow the generation contract above. Output only valid YAML, with no text before or after it.`,
+		dslGuide, userPrompt)
+	// Add available codebase indexes if any exist
+	if len(availableIndexes) > 0 {
+		basePrompt += "\n\n--- AVAILABLE CODEBASE INDEXES ---\n"
+		basePrompt += "The following codebase indexes are available in the .comanda/ directory:\n"
+		for _, idx := range availableIndexes {
+			basePrompt += fmt.Sprintf("- %s\n", idx)
+		}
+		basePrompt += "\nTo use a codebase index, reference it as input: .comanda/<index_name>\n"
+		basePrompt += "For agentic workflows, include .comanda in allowed_paths so the agent can read the index.\n"
+		basePrompt += "--- END AVAILABLE INDEXES ---"
+	}
 
-		// Get the provider
-		// Note: This assumes models.DetectProvider and provider.Configure are correctly set up.
-		// The provider instance needs to be configured with an API key.
-		// This logic might need to be more robust, potentially calling a configure method on the provider.
-		provider := models.DetectProvider(modelForGeneration)
-		if provider == nil {
-			return fmt.Errorf("could not detect provider for model: %s", modelForGeneration)
+	// Add feedback about previous validation errors
+	if len(invalidModels) > 0 || structureErrors != "" {
+		basePrompt += "\n\n--- VALIDATION ERRORS FROM PREVIOUS ATTEMPT (FIX THESE) ---"
+
+		if len(invalidModels) > 0 {
+			basePrompt += fmt.Sprintf(`
+
+MODEL ERROR: Your previous response used invalid model name(s): %v
+You MUST only use models from the "Supported Models" list in the specification above.`, invalidModels)
 		}
 
-		// Attempt to configure the provider with API key from envConfig
-		providerConfig, err := envConfig.GetProviderConfig(provider.Name())
-		if err != nil {
-			// If provider is not in envConfig, it might be a public one like Ollama, or an error
-			fmt.Printf("Warning: Provider %s not found in env configuration. Assuming it does not require an API key or is pre-configured.\n", provider.Name())
-		} else {
-			if err := provider.Configure(providerConfig.APIKey); err != nil {
-				return fmt.Errorf("failed to configure provider %s: %w", provider.Name(), err)
+		if structureErrors != "" {
+			basePrompt += fmt.Sprintf(`
+
+STRUCTURE ERRORS:
+%s
+
+Please fix all the above errors and regenerate the workflow.`, structureErrors)
+		}
+
+		basePrompt += "\n--- END VALIDATION ERRORS ---"
+	}
+
+	return basePrompt
+}
+
+// resolveOutputPath checks if .comanda/ exists and prefixes plain filenames with it.
+// This keeps generated workflows organized in the .comanda/ directory.
+// If user provides a path (contains / or \), we respect their choice.
+func resolveOutputPath(filename string) string {
+	// If user specified a path (contains directory separator), use as-is
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		return filename
+	}
+
+	// Check if .comanda/ directory exists
+	comandaDir := ".comanda"
+	if info, err := os.Stat(comandaDir); err == nil && info.IsDir() {
+		// .comanda exists, save workflow there
+		return filepath.Join(comandaDir, filename)
+	}
+
+	// No .comanda directory, use current directory
+	return filename
+}
+
+// detectAvailableIndexes looks for codebase indexes in .comanda/ directory
+func detectAvailableIndexes() []string {
+	var indexes []string
+
+	// Check current directory's .comanda/
+	comandaDir := ".comanda"
+	entries, err := os.ReadDir(comandaDir)
+	if err != nil {
+		return indexes // No .comanda directory or can't read it
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Look for index files (ending in _INDEX.md, not .meta.json)
+		if strings.HasSuffix(name, "_INDEX.md") && !strings.HasSuffix(name, ".meta.json") {
+			indexes = append(indexes, name)
+		}
+	}
+
+	return indexes
+}
+
+// extractYAMLContent extracts YAML from an LLM response, handling code blocks
+func extractYAMLContent(response string) string {
+	yamlContent := response
+
+	// Check if the response contains code blocks
+	if strings.Contains(response, "```yaml") {
+		startMarker := "```yaml"
+		endMarker := "```"
+
+		startIdx := strings.Index(response, startMarker)
+		if startIdx != -1 {
+			startIdx += len(startMarker)
+			remaining := response[startIdx:]
+			endIdx := strings.Index(remaining, endMarker)
+			if endIdx != -1 {
+				yamlContent = strings.TrimSpace(remaining[:endIdx])
 			}
 		}
-		provider.SetVerbose(verbose)
-
-		// Call the LLM
-		// The SendPrompt method is part of the models.Provider interface.
-		generatedResponse, err := provider.SendPrompt(modelForGeneration, fullPrompt)
-		if err != nil {
-			return fmt.Errorf("LLM execution failed for model '%s': %w", modelForGeneration, err)
-		}
-
-		// Extract YAML content from the response
-		yamlContent := generatedResponse
-
-		// Check if the response contains code blocks
-		if strings.Contains(generatedResponse, "```yaml") {
-			// Extract content between ```yaml and ```
-			startMarker := "```yaml"
-			endMarker := "```"
-
-			startIdx := strings.Index(generatedResponse, startMarker)
-			if startIdx != -1 {
-				startIdx += len(startMarker)
-				// Find the next ``` after the start marker
-				remaining := generatedResponse[startIdx:]
-				endIdx := strings.Index(remaining, endMarker)
-				if endIdx != -1 {
-					yamlContent = strings.TrimSpace(remaining[:endIdx])
-				}
-			}
-		} else if strings.Contains(generatedResponse, "```") {
-			// Try generic code block
-			parts := strings.Split(generatedResponse, "```")
-			if len(parts) >= 3 {
-				// Take the content of the first code block
-				yamlContent = strings.TrimSpace(parts[1])
-				// Remove language identifier if present (e.g., "yaml" at the start)
-				lines := strings.Split(yamlContent, "\n")
-				if len(lines) > 0 && !strings.Contains(lines[0], ":") {
-					yamlContent = strings.Join(lines[1:], "\n")
-				}
+	} else if strings.Contains(response, "```") {
+		parts := strings.Split(response, "```")
+		if len(parts) >= 3 {
+			yamlContent = strings.TrimSpace(parts[1])
+			lines := strings.Split(yamlContent, "\n")
+			if len(lines) > 0 && !strings.Contains(lines[0], ":") {
+				yamlContent = strings.Join(lines[1:], "\n")
 			}
 		}
+	}
 
-		// Save the generated YAML to the output file
-		if err := os.WriteFile(outputFilename, []byte(yamlContent), 0644); err != nil {
-			return fmt.Errorf("failed to write generated workflow to '%s': %w", outputFilename, err)
+	return yamlContent
+}
+
+// expandPathsInYAML expands ~ paths in common YAML path fields
+// This ensures agents don't see unexpanded ~ paths which they can't resolve
+func expandPathsInYAML(yamlContent string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return yamlContent // Can't expand without home dir
+	}
+
+	lines := strings.Split(yamlContent, "\n")
+	result := make([]string, len(lines))
+
+	// Path fields that commonly contain file paths
+	pathKeys := []string{
+		"root:",
+		"allowed_paths:",
+		"path:",
+		"output:",
+		"input:",
+		"workflow_file:",
+	}
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check if this line contains a path field
+		isPathLine := false
+		for _, key := range pathKeys {
+			if strings.Contains(trimmed, key) {
+				isPathLine = true
+				break
+			}
 		}
 
-		fmt.Printf("\n%s Workflow successfully generated and saved to %s\n", "\u2705", outputFilename)
-		return nil
-	},
+		// Also check for lines that are list items (- ~/path)
+		if strings.HasPrefix(trimmed, "- ~/") || strings.HasPrefix(trimmed, "- \"~/") || strings.HasPrefix(trimmed, "- '~/") {
+			isPathLine = true
+		}
+
+		if isPathLine && strings.Contains(line, "~/") {
+			// Replace ~/ with actual home directory
+			line = strings.ReplaceAll(line, "~/", homeDir+"/")
+		}
+
+		result[i] = line
+	}
+
+	return strings.Join(result, "\n")
 }
 
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug logging")
 	generateCmd.Flags().StringVarP(&generateModelName, "model", "m", "", "Model to use for workflow generation (optional, uses default if not set)")
+	improveCmd.Flags().StringVarP(&improveModelName, "model", "m", "", "Model to use for workflow improvement (optional, uses default if not set)")
 	rootCmd.AddCommand(generateCmd)
+	rootCmd.AddCommand(improveCmd)
 	rootCmd.AddCommand(versionCmd) // Add the version command
 }
 
-// getVersionFromFile attempts to read the version from the VERSION file
-func getVersionFromFile() string {
-	// Try to find the VERSION file in the executable's directory first
-	execPath, err := os.Executable()
-	if err == nil {
-		execDir := filepath.Dir(execPath)
-		versionPath := filepath.Join(execDir, "VERSION")
-		content, err := os.ReadFile(versionPath)
-		if err == nil {
-			return strings.TrimSpace(string(content))
-		}
+// getVersion returns the version string.
+// Priority: build-time ldflags > VERSION file (for development)
+func getVersion() string {
+	// 1. Use build-time injected version if available (set via ldflags)
+	if version != "" {
+		return version
 	}
 
-	// If not found, try the current working directory
-	cwd, err := os.Getwd()
-	if err == nil {
-		versionPath := filepath.Join(cwd, "VERSION")
-		content, err := os.ReadFile(versionPath)
-		if err == nil {
-			return strings.TrimSpace(string(content))
-		}
-	}
-
-	// If still not found, try relative to the source file (for development)
-	// This assumes the VERSION file is in the project root
-	// and cmd/root.go is in the cmd directory
+	// 2. For local development: try to read VERSION file from project root
+	// This allows `go run .` to show the correct version without ldflags
 	_, filename, _, ok := runtime.Caller(0)
 	if ok {
 		sourceDir := filepath.Dir(filename)
@@ -214,26 +797,20 @@ func getVersionFromFile() string {
 		versionPath := filepath.Join(projectRoot, "VERSION")
 		content, err := os.ReadFile(versionPath)
 		if err == nil {
-			return strings.TrimSpace(string(content))
+			return "v" + strings.TrimSpace(string(content)) + "-dev"
 		}
 	}
 
-	// Fallback to the build-time version or unknown
-	if version != "" {
-		return version
-	}
-
-	return "unknown"
+	return "unknown (build with: go build -ldflags \"-X 'github.com/kris-hansen/comanda/cmd.version=vX.Y.Z'\")"
 }
 
 // versionCmd represents the version command
 var versionCmd = &cobra.Command{
 	Use:   "version",
-	Short: "Print the version number of Comanda",
-	Long:  `All software has versions. This is Comanda's.`,
+	Short: "Print version information",
+	Long:  `Display the current Comanda version.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		versionStr := getVersionFromFile()
-		fmt.Printf("Comanda version: %s\n", versionStr)
+		log.Printf("Comanda version: %s\n", getVersion())
 	},
 }
 
@@ -248,7 +825,7 @@ func Execute() {
 			cmdPath := strings.Trim(strings.TrimPrefix(errMsg, "unknown command"), `"`+` for "comanda"`)
 			// Check if the unknown command might be a filename intended for 'process'
 			if _, statErr := os.Stat(cmdPath); statErr == nil || os.IsNotExist(statErr) { // if it exists or looks like a path
-				fmt.Printf("To process a file, use the 'process' command:\n\n   comanda process %s\n\n", cmdPath)
+				log.Printf("To process a file, use the 'process' command:\n\n   comanda process %s\n\n", cmdPath)
 			} else {
 				fmt.Fprintln(os.Stderr, err) // Default error for other unknown commands
 			}

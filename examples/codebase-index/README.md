@@ -1,0 +1,280 @@
+# Codebase Index Examples
+
+The `codebase-index` step type scans a repository and generates a compact Markdown index optimized for LLM consumption. This enables downstream workflow steps to understand codebase structure without processing every file.
+
+## Quick Start
+
+```bash
+# Generate an index for the sample project
+comanda run basic-index.yaml
+
+# Index and analyze with an LLM
+comanda run index-and-analyze.yaml
+```
+
+## How It Works
+
+1. **Language Detection**: Automatically detects Go, Python, TypeScript, Flutter, and Java codebases
+2. **Smart Scanning**: Uses parallel workers with early pruning for performance
+3. **Symbol Extraction**: Extracts functions, types, and imports using AST (Go) or regex
+4. **Markdown Synthesis**: Generates a structured index with key sections
+5. **Component Mapping**: Detects monorepo-style component boundaries (frontend/backend/mobile/CLI/shared libraries)
+6. **Optional AI Enhancement**: With `enhance: true`, runs a second pass using the default generation model for macro architecture analysis
+7. **Variable Export**: Exposes the index as workflow variables for downstream steps
+
+## Workflow Variables
+
+After the `codebase-index` step runs, these variables are available:
+
+| Variable | Description |
+|----------|-------------|
+| `<REPO>_INDEX` | Full Markdown content of the index |
+| `<REPO>_INDEX_PATH` | Path to the saved index file |
+| `<REPO>_INDEX_SHA` | Hash of the index content |
+| `<REPO>_INDEX_UPDATED` | `true` if index was regenerated |
+
+The `<REPO>` prefix is derived from the repository name (e.g., `SAMPLE_PROJECT_INDEX`).
+
+## Examples
+
+### Basic Index Generation
+
+```yaml
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./my-project
+    output:
+      store: repo
+    expose:
+      workflow_variable: true
+```
+
+### Using Index with LLM
+
+```yaml
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./my-project
+
+analyze:
+  model: claude-code
+  input: STDIN
+  action: |
+    Here is the codebase index:
+    {{ env "MY_PROJECT_INDEX" }}
+
+    Please analyze the architecture.
+  output: STDOUT
+```
+
+### Custom Configuration
+
+```yaml
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./my-project
+    output:
+      path: docs/INDEX.md      # Custom output path
+      store: repo              # Where to store: repo, config, both
+      encrypt: false           # Enable AES-256 encryption
+    expose:
+      workflow_variable: true
+      memory:
+        enabled: true          # Register as memory source
+        key: project.index
+    adapters:
+      go:
+        ignore_dirs:
+          - vendor
+          - testdata
+        priority_files:
+          - cmd/**/*.go
+    # Optional local parser executables for project-specific formats.
+    # Keep this workflow and parser source in your private project if needed.
+    parser_plugins:
+      - name: private-template
+        command: /absolute/path/to/private-template-parser
+        extensions: [.templatex]
+    max_output_kb: 100         # Limit output size
+    max_files: 10000            # Source files to index (0 = unlimited)
+```
+
+### Enhanced Monorepo / Macro Analysis
+
+Use enhancement when the index should help future coding agents understand deeper architecture, not just list files and symbols. The first pass remains the fast deterministic scanner; the second pass uses your configured `default_generation_model` (or `enhance_model`) to add component boundaries, frontend/backend patterns, cross-cutting conventions, and an agent change playbook.
+
+The normal deterministic index also mines repeated local file-role patterns for the **Code Conventions & Patterns** section. For example, repeated `cmd/.../main.go`, `db/store.go`, `manager.go`, `handler.go`, `validator.go`, and `*_test.go` files become evidence-backed editing guidance with concrete paths and confidence scores. Use `--enhance` when you also want the model to synthesize deeper conventions across components and call out unknowns that need follow-up exploration.
+
+```yaml
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./large-monorepo
+    output:
+      format: structured
+    enhance: true
+    # Optional override; otherwise default_generation_model is used
+    enhance_model: claude-code
+```
+
+CLI equivalent:
+
+```bash
+comanda index capture --enhance
+comanda index capture --enhance --enhance-model claude-code
+```
+
+## Configuration Reference
+
+### `root`
+Repository path to scan. Defaults to current directory.
+
+### `output`
+- `path`: Custom output file path (default: `.comanda/<repo>_INDEX.md`)
+- `store`: Where to save - `repo` (in repo), `config` (~/.comanda/), or `both`
+- `encrypt`: Enable AES-256 GCM encryption (saves as `.enc`). Requires encryption key to be configured.
+
+**Note on encryption**: When `encrypt: true`, the index file is stored encrypted on disk but the workflow variable (`<REPO>_INDEX`) contains plaintext for LLM consumption. Configure the encryption key using either method:
+
+```bash
+# Option 1: Via comanda configure (Security Settings > Set index encryption key)
+comanda configure
+
+# Option 2: Via environment variable (takes precedence over config)
+export COMANDA_INDEX_KEY="your-secret-key"
+comanda run encrypted-index.yaml
+```
+
+### `expose`
+- `workflow_variable`: Export as workflow variable (default: true)
+- `memory.enabled`: Register as memory source
+- `memory.key`: Key name for memory access
+
+### `adapters`
+Per-language configuration overrides:
+- `ignore_dirs`: Additional directories to ignore
+- `ignore_globs`: File patterns to ignore (e.g., `*.generated.go`)
+- `priority_files`: Files to prioritize in scoring
+- `replace_defaults`: Replace default ignores instead of extending
+
+### `parser_plugins`
+
+`parser_plugins` adds an explicitly configured, locally executed parser for a
+project-specific source format. This is intended for private DSLs, templates,
+or generated-code formats that should never be added to Comanda itself.
+
+Each plugin has:
+
+- `name`: unique adapter name (it cannot replace a built-in adapter)
+- `command`: executable to run directly; no shell is involved
+- `args`: optional command arguments
+- `extensions`: file extensions it owns (for example, `[.templatex]`)
+- `detection_files`, `ignore_dirs`, `ignore_globs`, `entrypoint_patterns`,
+  `config_patterns`: optional scanner behavior
+- `priority`: optional score boost for matching files
+- `timeout_ms`: per-file timeout; defaults to 5000
+
+For CLI captures, keep the declaration in a local YAML file and point to it
+without committing either file:
+
+```bash
+comanda index capture ./my-project \
+  --parser-plugin ~/.config/comanda/private-template-parser.yaml
+```
+
+The manifest is saved with the local index registry so `comanda index update`
+uses it again. Pass `--parser-plugin` to `update` to replace the saved list.
+
+#### Parser protocol
+
+For each matching file, Comanda starts the configured command and writes one
+JSON request to stdin:
+
+```json
+{
+  "version": 1,
+  "root": "/absolute/path/to/project",
+  "path": "templates/page.templatex",
+  "content": "first 32KB of source",
+  "max_bytes": 32768
+}
+```
+
+The parser writes exactly one JSON response to stdout:
+
+```json
+{
+  "symbols": {
+    "package": "templates",
+    "imports": ["shared/layout"],
+    "functions": [{"name": "RenderPage", "signature": "RenderPage()"}],
+    "types": [],
+    "constants": [],
+    "variables": [],
+    "frameworks": [],
+    "risk_tags": []
+  }
+}
+```
+
+Or return `{"error":"explanation"}` for a per-file parser error. Plugin
+commands run only because you explicitly configured them; Comanda does not
+upload their code, source contents, or manifests.
+
+### `max_output_kb`
+Maximum size of generated index in KB (default: 100).
+
+### `max_files`
+Maximum source files selected for indexing (default: 10,000). Set to `0` for no source-file cap.
+
+### `enhance` / `enhance_model`
+- `enhance`: Run the optional second-pass AI macro analysis (default: false).
+- `enhance_model`: Model for enhancement; defaults to configured `default_generation_model`.
+
+Enhanced output is best for large or mixed-language repositories where future agents need architectural guidance before making changes.
+
+## Index Output Structure
+
+The generated index includes these sections (when data is available):
+
+1. **Purpose** - Languages detected, file counts
+2. **Component Map** - Monorepo/component boundaries with frontend/backend/CLI/mobile/shared-library roles
+3. **Repository Layout** - Directory tree (depth-limited)
+4. **Primary Capabilities** - Inferred from directory names
+5. **Entry Points** - main.go, index.ts, etc.
+6. **Key Modules** - Grouped by directory
+7. **Important Files** - Top-scored files with symbols
+8. **Code Conventions & Patterns** - Evidence-backed local patterns, agent guidance, evidence paths, and confidence
+9. **Operational Notes** - Build, test, CI files
+10. **Risk/Caution Areas** - Auth, crypto, database code
+11. **Navigation Hints** - Conventions detected
+12. **AI Macro Analysis** - Optional second-pass architecture analysis when `enhance: true`
+13. **Footer** - Generation timestamp and scan time
+
+## Supported Languages
+
+| Language | Detection Files | Symbol Extraction |
+|----------|-----------------|-------------------|
+| Go | `go.mod`, `go.sum` | AST parsing |
+| Python | `pyproject.toml`, `requirements.txt` | Regex |
+| TypeScript | `tsconfig.json`, `package.json` | Regex |
+| Flutter | `pubspec.yaml` | Regex |
+| Java | `pom.xml`, `build.gradle`, `build.gradle.kts` | Regex |
+
+## Sample Project
+
+The `sample-project/` directory contains a minimal Go API to demonstrate indexing:
+
+```
+sample-project/
+  go.mod
+  cmd/server/main.go      # Entry point
+  pkg/handlers/users.go   # HTTP handlers
+  pkg/models/user.go      # Data models
+  internal/config/        # Configuration
+```
+
+Run the examples against this project to see the index output.

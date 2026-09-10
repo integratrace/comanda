@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kris-hansen/comanda/utils/fileutil"
@@ -17,6 +19,7 @@ import (
 // OllamaProvider handles Ollama family of models
 type OllamaProvider struct {
 	verbose bool
+	mu      sync.Mutex
 }
 
 // OllamaRequest represents the request structure for Ollama API
@@ -42,10 +45,12 @@ func (o *OllamaProvider) Name() string {
 	return "ollama"
 }
 
-// debugf prints debug information if verbose mode is enabled
+// debugf prints debug information if verbose mode is enabled (thread-safe)
 func (o *OllamaProvider) debugf(format string, args ...interface{}) {
 	if o.verbose {
-		fmt.Printf("[DEBUG][Ollama] "+format+"\n", args...)
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		log.Printf("[DEBUG][Ollama] "+format+"\n", args...)
 	}
 }
 
@@ -53,7 +58,7 @@ func (o *OllamaProvider) debugf(format string, args ...interface{}) {
 // Ollama can accept any model name and let the actual local availability check determine if it exists.
 func (o *OllamaProvider) SupportsModel(modelName string) bool {
 	o.debugf("Checking if model is supported: %s", modelName)
-	
+
 	// Ollama can potentially support any model that users have pulled locally
 	// The actual validation happens in isModelAvailableLocally() or checkOllamaModelExists()
 	o.debugf("Ollama provider can support model: %s (will check local availability)", modelName)

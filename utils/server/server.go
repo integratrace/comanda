@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -244,14 +245,43 @@ func New(envConfig *config.EnvConfig) (*http.Server, error) {
 	return server, nil
 }
 
+// serverVersion is the comanda version reported by /health. It is injected
+// at startup (see SetVersion) because the version string lives in the cmd
+// package, which imports this one.
+var serverVersion string
+
+// SetVersion sets the version string reported by the /health endpoint
+func SetVersion(v string) {
+	serverVersion = v
+}
+
+// capabilities returns the feature flags reported by /health so clients can
+// progressively enable functionality based on what this server supports
+func (s *Server) capabilities() []string {
+	caps := []string{
+		"full-dsl",            // /process, /yaml/process parse the complete DSL (parallel, loops, defer, workflow)
+		"yaml-validate",       // POST /yaml/validate
+		"log-events",          // SSE "log" events with stream-log lines during streaming execution
+		"progress-metrics",    // SSE "progress" events include per-step performance metrics
+		"stream-no-timeout",   // streaming runs are not time-limited unless configured
+		"knowledge-graph-api", // read-only /graph navigation endpoints
+	}
+	if s.config.OpenAICompat.Enabled {
+		caps = append(caps, "openai-compat")
+	}
+	return caps
+}
+
 // routes sets up the server routes
 func (s *Server) routes() {
 	// Health check endpoint - no auth required
 	s.mux.HandleFunc("/health", s.combinedMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(HealthResponse{
-			Status:    "ok",
-			Timestamp: time.Now().Format(time.RFC3339),
+			Status:       "ok",
+			Timestamp:    time.Now().Format(time.RFC3339),
+			Version:      serverVersion,
+			Capabilities: s.capabilities(),
 		})
 	}))
 
@@ -264,6 +294,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/files/content", s.combinedMiddleware(s.handleGetFileContent))
 	s.mux.HandleFunc("/files/upload", s.combinedMiddleware(s.handleFileUpload))
 	s.mux.HandleFunc("/files/download", s.combinedMiddleware(s.handleFileDownload))
+
+	// Project context is the discovery contract used by Canvas before a run.
+	s.mux.HandleFunc("/context", s.combinedMiddleware(s.handleContext))
+	s.mux.HandleFunc("/preflight", s.combinedMiddleware(s.handlePreflight))
+	s.mux.HandleFunc("/validate", s.combinedMiddleware(s.handleValidate))
+
+	// Knowledge-graph navigation API. Requests require the same authentication
+	// as other server data endpoints and can address registered namespaces only.
+	s.mux.HandleFunc("/graph", s.combinedMiddleware(s.handleGraphAPI))
+	s.mux.HandleFunc("/graph/", s.combinedMiddleware(s.handleGraphAPI))
 
 	// Provider operations - require auth
 	s.mux.HandleFunc("/providers", s.combinedMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +413,7 @@ func (s *Server) routes() {
 	// YAML operations - require auth
 	s.mux.HandleFunc("/yaml/upload", s.combinedMiddleware(s.handleYAMLUpload))
 	s.mux.HandleFunc("/yaml/process", s.combinedMiddleware(s.handleYAMLProcess))
+	s.mux.HandleFunc("/yaml/validate", s.combinedMiddleware(s.handleYAMLValidate))
 
 	// Process endpoint - requires auth
 	s.mux.HandleFunc("/process", s.combinedMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -381,6 +422,22 @@ func (s *Server) routes() {
 
 	// Generate endpoint - requires auth
 	s.mux.HandleFunc("/generate", s.combinedMiddleware(s.handleGenerate))
+
+	// OpenAI compatibility endpoints (if enabled)
+	if s.config.OpenAICompat.Enabled {
+		prefix := s.config.OpenAICompat.Prefix
+		if prefix == "" {
+			prefix = "/v1"
+		}
+
+		// GET /v1/models - List available models (workflows)
+		s.mux.HandleFunc(prefix+"/models", s.combinedMiddleware(s.handleListModels))
+
+		// POST /v1/chat/completions - Chat completion endpoint
+		s.mux.HandleFunc(prefix+"/chat/completions", s.combinedMiddleware(s.handleChatCompletions))
+
+		log.Printf("OpenAI compatibility mode enabled at %s\n", prefix)
+	}
 }
 
 // Run creates and starts the HTTP server with the given configuration
@@ -395,16 +452,16 @@ func Run(envConfig *config.EnvConfig) error {
 		return fmt.Errorf("server configuration not found")
 	}
 
-	fmt.Printf("Starting server on port %d...\n", serverConfig.Port)
-	fmt.Printf("Data directory: %s\n", serverConfig.DataDir)
-	fmt.Printf("Runtime directories can be specified with the runtimeDir query parameter\n")
+	log.Printf("Starting server on port %d...\n", serverConfig.Port)
+	log.Printf("Data directory: %s\n", serverConfig.DataDir)
+	log.Printf("Runtime directories can be specified with the runtimeDir query parameter\n")
 
 	if serverConfig.Enabled {
-		fmt.Println("Authentication is enabled. Bearer token required.")
-		fmt.Printf("Example usage: curl -H 'Authorization: Bearer %s' 'http://localhost:%d/process?filename=examples/openai-example.yaml'\n",
+		log.Printf("Authentication is enabled. Bearer token required.\n")
+		log.Printf("Example usage: curl -H 'Authorization: Bearer %s' 'http://localhost:%d/process?filename=examples/openai-example.yaml'\n",
 			maskToken(serverConfig.BearerToken), serverConfig.Port)
 	} else {
-		fmt.Printf("Example usage: curl 'http://localhost:%d/process?filename=examples/openai-example.yaml'\n", serverConfig.Port)
+		log.Printf("Example usage: curl 'http://localhost:%d/process?filename=examples/openai-example.yaml'\n", serverConfig.Port)
 	}
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

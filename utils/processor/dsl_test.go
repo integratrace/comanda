@@ -1,12 +1,16 @@
 package processor
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/kris-hansen/comanda/utils/codebaseindex"
 	"github.com/kris-hansen/comanda/utils/config"
 	"github.com/kris-hansen/comanda/utils/models"
 	"gopkg.in/yaml.v3"
@@ -104,6 +108,88 @@ func TestNewProcessor(t *testing.T) {
 	}
 }
 
+func TestSubstituteCLIVariables(t *testing.T) {
+	cliVars := map[string]string{
+		"filename":     "/path/to/file.txt",
+		"project_name": "myproject",
+		"output_dir":   "results",
+	}
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), createTestServerConfig(), false, "", cliVars)
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "no variables",
+			input:    "plain text",
+			expected: "plain text",
+		},
+		{
+			name:     "single variable without spaces",
+			input:    "tool: grep -E 'error' {{filename}}",
+			expected: "tool: grep -E 'error' /path/to/file.txt",
+		},
+		{
+			name:     "single variable with spaces",
+			input:    "tool: grep -E 'error' {{ filename }}",
+			expected: "tool: grep -E 'error' /path/to/file.txt",
+		},
+		{
+			name:     "multiple variables",
+			input:    "Analyze {{project_name}} and save to {{output_dir}}/results.txt",
+			expected: "Analyze myproject and save to results/results.txt",
+		},
+		{
+			name:     "undefined variable stays unchanged",
+			input:    "{{undefined_var}} should remain",
+			expected: "{{undefined_var}} should remain",
+		},
+		{
+			name:     "mixed variables",
+			input:    "{{filename}} and {{ project_name }} and {{undefined}}",
+			expected: "/path/to/file.txt and myproject and {{undefined}}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := processor.SubstituteCLIVariables(tt.input)
+			if result != tt.expected {
+				t.Errorf("SubstituteCLIVariables(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNewProcessorWithCLIVariables(t *testing.T) {
+	cliVars := map[string]string{
+		"test_var": "test_value",
+	}
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), createTestServerConfig(), false, "", cliVars)
+
+	if processor.cliVariables == nil {
+		t.Error("NewProcessor() did not initialize cliVariables")
+	}
+
+	if processor.cliVariables["test_var"] != "test_value" {
+		t.Errorf("NewProcessor() did not set cliVariables correctly, got %v", processor.cliVariables)
+	}
+}
+
+func TestNewProcessorWithoutCLIVariables(t *testing.T) {
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), createTestServerConfig(), false, "")
+
+	if processor.cliVariables == nil {
+		t.Error("NewProcessor() did not initialize cliVariables to empty map")
+	}
+
+	if len(processor.cliVariables) != 0 {
+		t.Errorf("NewProcessor() should have empty cliVariables, got %v", processor.cliVariables)
+	}
+}
+
 func TestValidateStepConfig(t *testing.T) {
 	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), createTestServerConfig(), false, "")
 
@@ -186,6 +272,27 @@ func TestValidateStepConfig(t *testing.T) {
 			},
 			expectedError: "",
 		},
+		{
+			name:     "codebase-index step type does not require standard fields",
+			stepName: "index_step",
+			config: StepConfig{
+				Type: "codebase-index",
+				CodebaseIndex: &CodebaseIndexConfig{
+					Root: ".",
+				},
+			},
+			expectedError: "",
+		},
+		{
+			name:     "codebase_index block does not require standard fields",
+			stepName: "index_step",
+			config: StepConfig{
+				CodebaseIndex: &CodebaseIndexConfig{
+					Root: "./my-project",
+				},
+			},
+			expectedError: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -203,6 +310,200 @@ func TestValidateStepConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildCodebaseIndexConfigEncryptionKey(t *testing.T) {
+	serverConfig := createTestServerConfig()
+	serverConfig.DataDir = t.TempDir()
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), serverConfig, false, "")
+
+	// Test that encryption key is picked up from environment
+	t.Run("encryption key from env var", func(t *testing.T) {
+		// Set env var
+		t.Setenv("COMANDA_INDEX_KEY", "test-secret-key")
+
+		stepConfig := StepConfig{
+			CodebaseIndex: &CodebaseIndexConfig{
+				Root: ".",
+				Output: &CodebaseIndexOutputConfig{
+					Encrypt: true,
+				},
+			},
+		}
+
+		config := processor.buildCodebaseIndexConfig(stepConfig)
+
+		if config.EncryptionKey != "test-secret-key" {
+			t.Errorf("EncryptionKey = %q, want %q", config.EncryptionKey, "test-secret-key")
+		}
+	})
+
+	// Test that encryption key is empty when encrypt is false
+	t.Run("no encryption key when encrypt false", func(t *testing.T) {
+		t.Setenv("COMANDA_INDEX_KEY", "test-secret-key")
+
+		stepConfig := StepConfig{
+			CodebaseIndex: &CodebaseIndexConfig{
+				Root: ".",
+				Output: &CodebaseIndexOutputConfig{
+					Encrypt: false,
+				},
+			},
+		}
+
+		config := processor.buildCodebaseIndexConfig(stepConfig)
+
+		if config.EncryptionKey != "" {
+			t.Errorf("EncryptionKey should be empty when encrypt=false, got %q", config.EncryptionKey)
+		}
+	})
+
+	// Test that encryption key is empty when env var not set and config not set
+	t.Run("empty encryption key when neither set", func(t *testing.T) {
+		// Ensure env var is not set
+		t.Setenv("COMANDA_INDEX_KEY", "")
+
+		stepConfig := StepConfig{
+			CodebaseIndex: &CodebaseIndexConfig{
+				Root: ".",
+				Output: &CodebaseIndexOutputConfig{
+					Encrypt: true,
+				},
+			},
+		}
+
+		config := processor.buildCodebaseIndexConfig(stepConfig)
+
+		if config.EncryptionKey != "" {
+			t.Errorf("EncryptionKey should be empty when neither set, got %q", config.EncryptionKey)
+		}
+	})
+
+	// Test that encryption key falls back to config when env var not set
+	t.Run("encryption key from config when env var not set", func(t *testing.T) {
+		// Ensure env var is not set
+		t.Setenv("COMANDA_INDEX_KEY", "")
+
+		// Create a processor with config that has IndexEncryptionKey
+		envCfg := createTestEnvConfig()
+		envCfg.IndexEncryptionKey = "config-secret-key"
+		procWithKey := NewProcessor(&DSLConfig{}, envCfg, serverConfig, false, "")
+
+		stepConfig := StepConfig{
+			CodebaseIndex: &CodebaseIndexConfig{
+				Root: ".",
+				Output: &CodebaseIndexOutputConfig{
+					Encrypt: true,
+				},
+			},
+		}
+
+		config := procWithKey.buildCodebaseIndexConfig(stepConfig)
+
+		if config.EncryptionKey != "config-secret-key" {
+			t.Errorf("EncryptionKey = %q, want %q", config.EncryptionKey, "config-secret-key")
+		}
+	})
+
+	// Test that env var takes precedence over config
+	t.Run("env var takes precedence over config", func(t *testing.T) {
+		t.Setenv("COMANDA_INDEX_KEY", "env-secret-key")
+
+		// Create a processor with config that has IndexEncryptionKey
+		envCfg := createTestEnvConfig()
+		envCfg.IndexEncryptionKey = "config-secret-key"
+		procWithKey := NewProcessor(&DSLConfig{}, envCfg, serverConfig, false, "")
+
+		stepConfig := StepConfig{
+			CodebaseIndex: &CodebaseIndexConfig{
+				Root: ".",
+				Output: &CodebaseIndexOutputConfig{
+					Encrypt: true,
+				},
+			},
+		}
+
+		config := procWithKey.buildCodebaseIndexConfig(stepConfig)
+
+		if config.EncryptionKey != "env-secret-key" {
+			t.Errorf("EncryptionKey = %q, want %q (env var should take precedence)", config.EncryptionKey, "env-secret-key")
+		}
+	})
+}
+
+func TestBuildCodebaseIndexConfigMaxFiles(t *testing.T) {
+	serverConfig := createTestServerConfig()
+	serverConfig.DataDir = t.TempDir()
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), serverConfig, false, "")
+
+	limit := 500
+	config := processor.buildCodebaseIndexConfig(StepConfig{
+		CodebaseIndex: &CodebaseIndexConfig{MaxFiles: &limit},
+	})
+	if config.MaxFiles != limit {
+		t.Errorf("MaxFiles = %d, want %d", config.MaxFiles, limit)
+	}
+
+	unlimited := 0
+	config = processor.buildCodebaseIndexConfig(StepConfig{
+		CodebaseIndex: &CodebaseIndexConfig{MaxFiles: &unlimited},
+	})
+	if config.MaxFiles != unlimited {
+		t.Errorf("MaxFiles = %d, want unlimited (%d)", config.MaxFiles, unlimited)
+	}
+}
+
+func TestCodebaseIndexMaxFilesYAML(t *testing.T) {
+	var config DSLConfig
+	err := yaml.Unmarshal([]byte(`
+index:
+  step_type: codebase-index
+  codebase_index:
+    root: .
+    max_files: 2500
+`), &config)
+	if err != nil {
+		t.Fatalf("unmarshal workflow: %v", err)
+	}
+	if len(config.Steps) != 1 || config.Steps[0].Config.CodebaseIndex == nil {
+		t.Fatal("codebase_index step was not parsed")
+	}
+	maxFiles := config.Steps[0].Config.CodebaseIndex.MaxFiles
+	if maxFiles == nil || *maxFiles != 2500 {
+		t.Fatalf("max_files = %v, want 2500", maxFiles)
+	}
+}
+
+func TestCodebaseIndexParserPluginsYAML(t *testing.T) {
+	var config DSLConfig
+	err := yaml.Unmarshal([]byte(`
+index:
+  step_type: codebase-index
+  codebase_index:
+    root: .
+    parser_plugins:
+      - name: private-template
+        command: /opt/private/template-parser
+        extensions: [.templatex]
+        timeout_ms: 1500
+`), &config)
+	if err != nil {
+		t.Fatalf("unmarshal workflow: %v", err)
+	}
+	plugin := config.Steps[0].Config.CodebaseIndex.ParserPlugins[0]
+	if plugin.Name != "private-template" || plugin.Command != "/opt/private/template-parser" || plugin.TimeoutMS != 1500 {
+		t.Fatalf("plugin = %#v", plugin)
+	}
+
+	serverConfig := createTestServerConfig()
+	serverConfig.DataDir = t.TempDir()
+	processor := NewProcessor(&DSLConfig{}, createTestEnvConfig(), serverConfig, false, "")
+	indexConfig := processor.buildCodebaseIndexConfig(StepConfig{CodebaseIndex: &CodebaseIndexConfig{
+		ParserPlugins: []codebaseindex.ParserPluginConfig{plugin},
+	}})
+	if len(indexConfig.ParserPlugins) != 1 || indexConfig.ParserPlugins[0].Name != "private-template" {
+		t.Fatalf("index parser plugins = %#v", indexConfig.ParserPlugins)
 	}
 }
 
@@ -306,6 +607,214 @@ func TestProcess(t *testing.T) {
 				t.Errorf("Process() unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestChunkingWithTemplateVariables(t *testing.T) {
+	// Create a temporary test file with enough content to chunk
+	tmpfile, err := os.CreateTemp("", "chunk-test-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	// Write 100 lines to ensure chunking happens
+	content := strings.Repeat("This is line content for testing chunking.\n", 100)
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	// Create a temporary output directory
+	outputDir, err := os.MkdirTemp("", "chunk-output-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(outputDir)
+
+	config := DSLConfig{
+		Steps: []Step{
+			{
+				Name: "chunk_test",
+				Config: StepConfig{
+					Input: tmpfile.Name(),
+					Chunk: &ChunkConfig{
+						By:        "lines",
+						Size:      30,
+						Overlap:   5,
+						MaxChunks: 10,
+					},
+					BatchMode: "individual",
+					Model:     "gpt-4o-mini",
+					Action:    "Summarize chunk {{ chunk_index }} of {{ total_chunks }}",
+					Output:    filepath.Join(outputDir, "output_chunk_{{ chunk_index }}.txt"),
+				},
+			},
+		},
+	}
+
+	processor := NewProcessor(&config, createTestEnvConfig(), createTestServerConfig(), true, "")
+
+	// Mock the provider to return predictable output
+	mockProvider := &MockProvider{}
+	processor.providers["openai"] = mockProvider
+
+	err = processor.Process()
+	if err != nil {
+		t.Fatalf("Process() failed: %v", err)
+	}
+
+	// Verify that multiple chunk files were created with proper names
+	files, err := filepath.Glob(filepath.Join(outputDir, "output_chunk_*.txt"))
+	if err != nil {
+		t.Fatalf("Failed to glob output files: %v", err)
+	}
+
+	if len(files) < 2 {
+		t.Errorf("Expected at least 2 chunk files, got %d. Files: %v", len(files), files)
+	}
+
+	// Verify that files have numeric indices, not template literals
+	for _, file := range files {
+		basename := filepath.Base(file)
+		if strings.Contains(basename, "{{") || strings.Contains(basename, "}}") {
+			t.Errorf("File still contains template literal: %s", basename)
+		}
+
+		// Verify the file matches the pattern output_chunk_N.txt where N is a number
+		if !strings.HasPrefix(basename, "output_chunk_") || !strings.HasSuffix(basename, ".txt") {
+			t.Errorf("File doesn't match expected pattern: %s", basename)
+		}
+	}
+
+	// Verify specific files exist
+	expectedFiles := []string{
+		filepath.Join(outputDir, "output_chunk_0.txt"),
+		filepath.Join(outputDir, "output_chunk_1.txt"),
+		filepath.Join(outputDir, "output_chunk_2.txt"),
+	}
+
+	for _, expectedFile := range expectedFiles {
+		if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
+			t.Errorf("Expected file not found: %s", expectedFile)
+		}
+	}
+}
+
+func TestBatchModeIndividualWithTemplateVariables(t *testing.T) {
+	// Create temporary test files to simulate wildcard expansion
+	tmpDir, err := os.MkdirTemp("", "batch-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create multiple input files (simulating requirements_chunk_*.txt)
+	for i := 0; i < 3; i++ {
+		tmpfile, err := os.CreateTemp(tmpDir, fmt.Sprintf("requirements_chunk_%d-*.txt", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := fmt.Sprintf("Requirement %d: This is test content for file %d\n", i, i)
+		if _, err := tmpfile.Write([]byte(content)); err != nil {
+			tmpfile.Close()
+			t.Fatal(err)
+		}
+		tmpfile.Close()
+	}
+
+	// Create a single additional file (simulating test_inventory.txt)
+	inventoryFile, err := os.CreateTemp(tmpDir, "test_inventory-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inventoryFile.Write([]byte("Test inventory content\n")); err != nil {
+		inventoryFile.Close()
+		t.Fatal(err)
+	}
+	inventoryFile.Close()
+
+	// Create output directory
+	outputDir, err := os.MkdirTemp("", "batch-output-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(outputDir)
+
+	// Get all requirement files
+	reqFiles, err := filepath.Glob(filepath.Join(tmpDir, "requirements_chunk_*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build input list (all requirement files + inventory file)
+	var inputs []interface{}
+	for _, f := range reqFiles {
+		inputs = append(inputs, f)
+	}
+	inputs = append(inputs, inventoryFile.Name())
+
+	config := DSLConfig{
+		Steps: []Step{
+			{
+				Name: "batch_test",
+				Config: StepConfig{
+					Input:     inputs,
+					BatchMode: "individual", // Key: using batch_mode individual without chunk: block
+					Model:     "gpt-4o-mini",
+					Action:    "Process this file",
+					Output:    filepath.Join(outputDir, "coverage_chunk_{{ chunk_index }}.txt"),
+				},
+			},
+		},
+	}
+
+	processor := NewProcessor(&config, createTestEnvConfig(), createTestServerConfig(), true, "")
+
+	// Mock the provider
+	mockProvider := &MockProvider{}
+	processor.providers["openai"] = mockProvider
+
+	err = processor.Process()
+	if err != nil {
+		t.Fatalf("Process() failed: %v", err)
+	}
+
+	// Verify that multiple output files were created with proper names (not literal template)
+	files, err := filepath.Glob(filepath.Join(outputDir, "coverage_chunk_*.txt"))
+	if err != nil {
+		t.Fatalf("Failed to glob output files: %v", err)
+	}
+
+	if len(files) != len(inputs) {
+		t.Errorf("Expected %d output files (one per input), got %d. Files: %v", len(inputs), len(files), files)
+	}
+
+	// Verify that files have numeric indices, not template literals
+	for _, file := range files {
+		basename := filepath.Base(file)
+		if strings.Contains(basename, "{{") || strings.Contains(basename, "}}") {
+			t.Errorf("File still contains template literal: %s", basename)
+		}
+
+		// Verify the file matches the pattern coverage_chunk_N.txt where N is a number
+		if !strings.HasPrefix(basename, "coverage_chunk_") || !strings.HasSuffix(basename, ".txt") {
+			t.Errorf("File doesn't match expected pattern: %s", basename)
+		}
+	}
+
+	// Verify specific files exist
+	for i := 0; i < len(inputs); i++ {
+		expectedFile := filepath.Join(outputDir, fmt.Sprintf("coverage_chunk_%d.txt", i))
+		if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
+			t.Errorf("Expected file not found: %s", expectedFile)
+		}
+	}
+
+	// Verify that NO file exists with literal template syntax
+	literalFile := filepath.Join(outputDir, "coverage_chunk_{{ chunk_index }}.txt")
+	if _, err := os.Stat(literalFile); !os.IsNotExist(err) {
+		t.Errorf("File with literal template syntax should NOT exist: %s", literalFile)
 	}
 }
 
@@ -643,6 +1152,84 @@ func TestFetchURL(t *testing.T) {
 						t.Errorf("Failed to process fetched file: %v", err)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestGetFileOutputPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   interface{}
+		expected string
+	}{
+		{
+			name:     "file path returns path",
+			output:   "/path/to/output.txt",
+			expected: "/path/to/output.txt",
+		},
+		{
+			name:     "relative file path returns path",
+			output:   "output.txt",
+			expected: "output.txt",
+		},
+		{
+			name:     "STDOUT returns empty",
+			output:   "STDOUT",
+			expected: "",
+		},
+		{
+			name:     "MEMORY returns empty",
+			output:   "MEMORY",
+			expected: "",
+		},
+		{
+			name:     "MEMORY section returns empty",
+			output:   "MEMORY:section_name",
+			expected: "",
+		},
+		{
+			name:     "tool output returns empty",
+			output:   "tool: jq '.data'",
+			expected: "",
+		},
+		{
+			name:     "pipe output returns empty",
+			output:   "STDOUT|grep pattern",
+			expected: "",
+		},
+		{
+			name:     "variable returns empty",
+			output:   "$MY_VAR",
+			expected: "",
+		},
+		{
+			name:     "empty string returns empty",
+			output:   "",
+			expected: "",
+		},
+		{
+			name:     "nil returns empty",
+			output:   nil,
+			expected: "",
+		},
+		{
+			name:     "non-string returns empty",
+			output:   123,
+			expected: "",
+		},
+		{
+			name:     "path with whitespace is trimmed",
+			output:   "  /path/to/file.txt  ",
+			expected: "/path/to/file.txt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getFileOutputPath(tt.output)
+			if result != tt.expected {
+				t.Errorf("getFileOutputPath(%v) = %q, want %q", tt.output, result, tt.expected)
 			}
 		})
 	}

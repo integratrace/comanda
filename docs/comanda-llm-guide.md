@@ -107,6 +107,66 @@ step_name_for_processing:
 - Database query: `input: { database: { type: "postgres", query: "SELECT * FROM users" } }`
 - No input: `input: NA`
 - Input with alias for variable: `input: path/to/file.txt as $my_var`
+
+### Codebase Indexes
+
+Comanda can generate and use codebase indexes - structured summaries of code repositories that help LLMs understand codebases without reading every file.
+
+**Index Location:**
+Codebase indexes are stored in the `.comanda/` directory at the root of a repository:
+- `.comanda/{repo_name}_INDEX.md` - The index file
+- `.comanda/{repo_name}_INDEX.md.meta.json` - Metadata about when/how the index was generated
+
+**Using Indexes in Workflows:**
+To give an LLM context about a codebase, use the index as input:
+
+```yaml
+analyze_codebase:
+  input: .comanda/myproject_INDEX.md
+  model: claude-sonnet-4-5
+  action: "Based on this codebase index, identify potential security concerns"
+  output: STDOUT
+```
+
+**Exploring the .comanda Directory:**
+For agentic workflows that need to work with code, point the agent to the `.comanda/` directory so it can discover available indexes:
+
+```yaml
+code_task:
+  model: claude-code
+  action: |
+    First, read the codebase index in .comanda/ to understand the project structure.
+    Then implement the requested feature.
+  agentic_loop:
+    max_iterations: 10
+    exit_condition: llm_decides
+    allowed_paths:
+      - .comanda
+      - ./src
+  output: STDOUT
+```
+
+**Note:** Index filenames use the repository/project name as a slug (e.g., `myproject_INDEX.md`, `comanda_INDEX.md`). When writing workflows, check what indexes exist in `.comanda/` or let the agent discover them.
+
+### The .comanda Directory
+
+The `.comanda/` directory is comanda's home for project-specific files:
+- **Codebase indexes:** `{project}_INDEX.md` files
+- **Generated workflows:** When you run `comanda generate workflow.yaml "prompt"`, if `.comanda/` exists the workflow is saved there automatically
+- **Workflow artifacts:** Outputs, logs, and intermediate files
+
+**Auto-save to .comanda/:**
+When running `comanda generate`, plain filenames (without paths) are automatically saved to `.comanda/`:
+
+```bash
+# If .comanda/ exists, saves to .comanda/analyze.yaml
+comanda generate analyze.yaml "analyze the codebase"
+
+# Explicit paths are respected as-is
+comanda generate ./workflows/analyze.yaml "analyze the codebase"
+```
+
+This keeps your project root clean while organizing comanda artifacts together.
 - List with aliases: `input: [file1.txt as $file1_content, file2.txt as $file2_content]`
 
 ### Chunking
@@ -164,6 +224,44 @@ consolidate_results:
 - Single model: `model: gpt-4o-mini`
 - No model (for non-LLM operations): `model: NA`
 - Multiple models (for comparison): `model: [gpt-4o-mini, claude-3-opus-20240229]`
+- **IMPORTANT**: When specifying a model, you **must** use one of the supported models configured in Comanda. Do not use model names that are not configured.
+
+### Model Selection Guidelines
+
+**CRITICAL: Choose models appropriate for task complexity:**
+
+**Use inexpensive/fast models (nano, mini, lite, flash, haiku) for:**
+- Simple text transformations and formatting
+- Data extraction and parsing
+- Straightforward summarization
+- Repetitive processing tasks
+- High-volume batch operations
+
+**Use flagship models (GPT-5.6 Sol, Grok 4.5, opus, pro, o1, o3) for:**
+- Complex reasoning and analysis
+- Creative writing and nuanced content
+- Multi-step problem solving
+- Tasks requiring deep understanding
+- Small token window tasks where quality matters most
+
+**Model tiers (from cheapest to most expensive):**
+- **Nano/Lite tier**: `gpt-5.6-luna`, `gpt-5-nano`, `gemini-2.5-flash-lite`
+- **Mini/Flash tier**: `gpt-5-mini`, `o4-mini`, `o3-mini`, `gemini-2.5-flash`, `claude-haiku-4-5`
+- **Standard tier**: `gpt-5.6-terra`, `gpt-4.1`, `grok-4.3`, `gemini-2.5-pro`, `claude-sonnet-4-5`
+- **Flagship tier**: `gpt-5.6-sol` (or alias `gpt-5.6`), `grok-4.5`, `o3-pro`, `claude-opus-4-5`, `gemini-3-pro-preview`
+
+**Claude Code models** (for agentic programming tasks via local Claude CLI):
+- `claude-code` - Default Claude Code model
+- `claude-code-opus` - Uses Claude Opus 4.5
+- `claude-code-sonnet` - Uses Claude Sonnet 4.5
+- `claude-code-haiku` - Uses Claude Haiku 4.5
+
+**llama.cpp GGUF models** (for local inference via `llama-cli`):
+- Use a direct `.gguf` file path as the model, e.g. `model: /models/qwen2.5-7b-instruct.gguf`
+- Or use an explicit prefix, e.g. `model: llama.cpp:/models/qwen2.5-7b-instruct.gguf`
+- `comanda configure` can register a GGUF file with a short alias, so workflows can use `model: qwen-local` instead of a full path
+- Set `LLAMA_CPP_BINARY` if `llama-cli` is not in `PATH`
+- Set `LLAMA_CPP_MODEL_DIR` or `LLAMA_CPP_MODEL_DIRS` to help `comanda configure` discover GGUF files
 
 ### Actions
 - Single instruction: `action: "Summarize this text."`
@@ -177,6 +275,38 @@ consolidate_results:
 - Database: `output: { database: { type: "postgres", table: "results_table" } }`
 - Output with alias (if supported for variable creation from output): `output: STDOUT as $step_output_var`
 
+### Tool Use (Shell Command Execution)
+
+Comanda supports executing shell commands as part of workflows using the `tool:` prefix.
+
+**Tool Input Formats:**
+- Simple command: `input: "tool: ls -la"`
+- Pipe previous output to command: `input: "tool: STDIN|grep pattern"`
+
+**Tool Output Formats:**
+- Pipe LLM output through command: `output: "tool: jq '.data'"`
+- Pipe STDOUT through command: `output: "STDOUT|grep pattern"`
+
+**Security Controls:**
+Tools execute with security controls - a default allowlist of safe read-only commands and a denylist of dangerous commands.
+
+**Safe commands (allowlist):** `ls`, `cat`, `head`, `tail`, `grep`, `awk`, `sed`, `jq`, `yq`, `sort`, `uniq`, `wc`, `cut`, `tr`, `diff`, `find`, `date`, `echo`, `base64`, etc.
+
+**Blocked commands (denylist):** `rm`, `sudo`, `chmod`, `curl`, `wget`, `ssh`, `bash`, `sh`, etc.
+
+**Step-level tool configuration:**
+```yaml
+step_name:
+  input: "tool: ls -la"
+  model: NA
+  tool_config:
+    allowlist: [ls, cat, grep, jq]  # Override default allowlist
+    denylist: [rm]                  # Additional commands to block
+    timeout: 60                      # Timeout in seconds (default: 30)
+  action: NA
+  output: STDOUT
+```
+
 ## Variables
 - Definition: `input: data.txt as $initial_data`
 - Reference: `action: "Compare this analysis with $initial_data"`
@@ -184,17 +314,18 @@ consolidate_results:
 
 ## Validation Rules Summary (for LLM)
 
-1.  A step definition must clearly be one of: Standard, Generate, or Process.
+1.  When specifying a model name, you **must** use one of the supported models configured in Comanda. Do not use model names that are not explicitly configured as supported.
+2.  A step definition must clearly be one of: Standard, Generate, or Process.
     *   A step cannot mix top-level keys from different types (e.g., a `generate` step should not have a top-level `model` or `output` key; these belong inside the `generate` block).
-2.  **Standard Step:**
+3.  **Standard Step:**
     *   Must contain `input`, `model`, `action`, `output` (unless `type: openai-responses`, where `action` might be replaced by `instructions`).
     *   `input` can be `NA`. `model` can be `NA`.
-3.  **Generate Step:**
+4.  **Generate Step:**
     *   Must contain a `generate` block.
     *   `generate` block must contain `action` (string prompt) and `output` (string filename).
     *   `generate.model` is optional (uses default if omitted).
     *   Top-level `input` for the step is optional (can be `NA` or provide context).
-4.  **Process Step:**
+5.  **Process Step:**
     *   Must contain a `process` block.
     *   `process` block must contain `workflow_file` (string path).
     *   `process.inputs` is optional.
@@ -265,5 +396,222 @@ final_summary:
 ```
 
 This file-based approach is the correct way to handle any workflow where a step's logic depends on having discrete access to multiple prior outputs.
+
+## CRITICAL: Workflow Simplicity Guidelines
+
+**ALWAYS prefer the simplest possible workflow.** Over-engineered workflows are harder to debug, maintain, and understand.
+
+**Key principles:**
+1. **Minimize steps**: If a task can be done in 1 step, don't use 3. Most tasks need 1-2 steps.
+2. **Avoid unnecessary chaining**: Don't chain steps unless the output of one is genuinely needed by the next.
+3. **Use direct file I/O**: If you need to read a file and process it, that's ONE step, not three.
+4. **Prefer STDIN/STDOUT**: Use simple STDIN/STDOUT chaining over complex file intermediates when sequential processing suffices.
+5. **One model per workflow when possible**: Don't use multiple models unless comparing outputs or the task genuinely requires different capabilities.
+
+**Examples of OVER-ENGINEERED workflows (AVOID):**
+```yaml
+# BAD: Too many steps for a simple task
+read_file:
+  input: document.txt
+  model: NA
+  action: NA
+  output: temp_content.txt
+
+analyze_content:
+  input: temp_content.txt
+  model: gpt-4o-mini
+  action: "Analyze this"
+  output: temp_analysis.txt
+
+format_output:
+  input: temp_analysis.txt
+  model: gpt-4o-mini
+  action: "Format nicely"
+  output: STDOUT
+```
+
+**GOOD: Simple and direct:**
+```yaml
+# GOOD: One step does the job
+analyze_document:
+  input: document.txt
+  model: gpt-4o-mini
+  action: "Analyze this document and format the output nicely"
+  output: STDOUT
+```
+
+**When multiple steps ARE appropriate:**
+- Processing different source files independently, then combining results
+- Using tool commands to pre-process data before LLM analysis
+- Generating a workflow dynamically, then executing it
+- Tasks that genuinely require different models for different capabilities
+
+## Agentic Loops
+
+Agentic loops enable iterative, autonomous execution where an AI agent can use tools (read/write files, run commands) to complete complex tasks.
+
+**Basic Structure:**
+```yaml
+complex_task:
+  model: claude-code
+  action: "Implement the feature described in requirements.md"
+  agentic_loop:
+    max_iterations: 10
+    exit_condition: llm_decides
+    allowed_paths:
+      - ./src
+      - ./tests
+    tools: [Read, Write, Edit, Bash]
+  output: ./implementation_report.md
+```
+
+### Output Configuration for Agentic Loops
+
+**Important:** Agentic loop output should almost always be a **file path**, not STDOUT.
+
+**Default to `.comanda/` flat paths:**
+- **Preferred:** `output: .comanda/ARCHITECTURE.md` or `output: .comanda/analysis_report.md`
+- **Avoid subdirectories** unless the user explicitly requests them (e.g., `./docs/`)
+- **Avoid STDOUT:** Agentic loops produce substantial output over multiple iterations
+
+The output file serves two purposes:
+1. It's where the agent writes its final deliverable
+2. It's automatically added to `allowed_paths` so the agent can write to it
+
+```yaml
+# GOOD: Output to .comanda/ directory (default for generated workflows)
+document_codebase:
+  model: claude-code
+  action: "Create comprehensive architecture documentation"
+  agentic_loop:
+    max_iterations: 15
+    exit_condition: llm_decides
+    allowed_paths: [.comanda]
+  output: .comanda/ARCHITECTURE.md
+
+# GOOD: Custom path when user specifies (ensure allowed_paths matches)
+document_codebase:
+  model: claude-code
+  action: "Create comprehensive architecture documentation"
+  agentic_loop:
+    max_iterations: 15
+    exit_condition: llm_decides
+    allowed_paths: [.comanda, ./docs]  # Include custom output dir
+  output: ./docs/ARCHITECTURE.md
+
+# BAD: Output to STDOUT for agentic work
+document_codebase:
+  model: claude-code
+  action: "Create comprehensive architecture documentation"
+  agentic_loop:
+    max_iterations: 15
+    exit_condition: llm_decides
+  output: STDOUT  # Don't do this - agent can't persist work!
+```
+
+**Exception:** Use `output: STDOUT` only for quick, single-iteration agentic queries where you want immediate console output.
+
+**Key Configuration:**
+- `max_iterations`: (int, default: 10) Maximum loop iterations before stopping
+- `exit_condition`: (string) When to stop - `llm_decides` (agent says DONE) or `pattern_match`
+- `allowed_paths`: (list of strings) Directories the agent can access
+- `tools`: (list of strings, optional) Tool whitelist - Read, Write, Edit, Bash, etc.
+- `prompt_improvement`: (map, optional) Automatically refine the next iteration's prompt based on the latest result
+
+### Simplified Path Configuration
+
+**If `allowed_paths` is empty or omitted**, comanda automatically infers sensible defaults:
+1. Uses the current working directory where `comanda process <workflow.yaml>` was invoked
+
+**Auto-expansion:** When allowed paths are set, comanda automatically adds:
+- Output directories (from step `output` paths)
+- Common project subdirectories that exist (src, lib, test, docs, build, etc.)
+
+This means simple workflows "just work" without explicit path configuration:
+
+```yaml
+# Simple - paths auto-inferred from cwd
+refactor_code:
+  model: claude-code
+  action: "Refactor the main module for clarity"
+  agentic_loop:
+    max_iterations: 5
+    exit_condition: llm_decides
+  output: STDOUT
+```
+
+**Explicit paths** are still recommended for:
+- Production workflows (explicit is better than implicit)
+- Restricting access to specific directories
+- Cross-directory operations
+
+```yaml
+# Explicit - for production or restricted access
+secure_task:
+  model: claude-code
+  action: "Process files in the data directory only"
+  agentic_loop:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths:
+      - ./data
+      - ./output
+  output: STDOUT
+```
+
+### Writing Effective Agentic Prompts
+
+When writing the `action` prompt for agentic loops, be explicit about permissions to avoid agent confusion:
+
+**Always include write permission confirmation:**
+```yaml
+action: |
+  Your task: Create comprehensive documentation for this codebase.
+  
+  ...task-specific instructions...
+  
+  WRITE ACCESS: You have full write permission to all paths in allowed_paths.
+  Write your content directly to files. Do not ask for permission or write
+  meta-commentary about permissions - just write the actual content.
+```
+
+**For multi-iteration document building:**
+```yaml
+action: |
+  Iteration {{ loop.iteration }} of {{ loop.total_iterations }}.
+  
+  ...iteration-specific instructions...
+  
+  Previous work: {{ loop.previous_output }}
+  
+  IMPORTANT:
+  - READ the existing output file first to see what's already written
+  - APPEND or UPDATE sections - don't start from scratch each iteration  
+  - You have full write access - write immediately, don't ask permission
+  - If the file contains permission-related text, overwrite it with real content
+```
+
+**For self-improving prompt loops:**
+```yaml
+agentic_loop:
+  max_iterations: 5
+  prompt_improvement:
+    enabled: true
+    instructions: |
+      Tighten the next prompt using the latest result.
+      Keep the user's goal, preserve what worked, and make the next prompt
+      more specific and actionable.
+```
+
+This stores the refined prompt for the next pass and exposes it as `{{ loop.current_prompt }}` alongside `{{ loop.previous_output }}`.
+
+**Why this matters:** Agents can misinterpret early errors as permission denials and enter a confused state where they write complaints about permissions instead of actual content. Explicit permission confirmation prevents this loop.
+
+### Error Handling
+
+When path access fails, comanda provides helpful error messages showing:
+- The path that couldn't be accessed
+- Currently allowed paths
+- A suggestion for what to add to `allowed_paths`
 
 This guide covers the core concepts and syntax of Comanda's YAML DSL, including meta-processing capabilities. LLMs should use this structure to generate valid workflow files.
