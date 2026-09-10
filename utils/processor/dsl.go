@@ -2380,10 +2380,18 @@ func (p *Processor) getProviderForModel(modelName string) (models.Provider, erro
 			newProvider = models.NewVLLMProvider()
 		case "llama.cpp":
 			newProvider = models.NewLlamaCPPProvider()
+		case "bedrock":
+			newProvider = models.NewBedrockProvider()
 		default:
 			return nil, fmt.Errorf("unknown provider: %s", providerName)
 		}
-		if err := newProvider.Configure(providerConfig.APIKey); err != nil {
+		// Bedrock uses the AWS credential chain rather than an api_key, and may
+		// not have a configured envConfig entry at all.
+		apiKey := ""
+		if providerConfig != nil {
+			apiKey = providerConfig.APIKey
+		}
+		if err := newProvider.Configure(apiKey); err != nil {
 			return nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 		}
 		newProvider.SetVerbose(p.verbose)

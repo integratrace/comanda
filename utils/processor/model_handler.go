@@ -375,6 +375,15 @@ func (p *Processor) configureProviders() error {
 			continue
 		}
 
+		// Handle Bedrock (uses the AWS credential chain, not an api_key)
+		if providerName == "bedrock" {
+			if err := provider.Configure(""); err != nil {
+				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+			}
+			p.debugf("Successfully configured Bedrock provider (using AWS credential chain)")
+			continue
+		}
+
 		var providerConfig *config.Provider
 		var err error
 
