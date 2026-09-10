@@ -1,0 +1,368 @@
+package codebaseindex
+
+import (
+	"time"
+
+	"github.com/kris-hansen/comanda/utils/filescan"
+)
+
+// HashAlgorithm specifies the hashing algorithm to use
+type HashAlgorithm string
+
+const (
+	HashXXHash  HashAlgorithm = "xxhash"
+	HashSHA256  HashAlgorithm = "sha256"
+	DefaultHash HashAlgorithm = HashXXHash
+)
+
+// StoreLocation specifies where to store the index
+type StoreLocation string
+
+const (
+	StoreRepo   StoreLocation = "repo"
+	StoreConfig StoreLocation = "config"
+	StoreBoth   StoreLocation = "both"
+)
+
+// OutputFormat specifies the format/verbosity of the generated index
+type OutputFormat string
+
+const (
+	// FormatSummary generates a compact overview (1-2KB)
+	// Contains: repo purpose, main areas, key entry points
+	// Best for: quick context, agent system prompts
+	FormatSummary OutputFormat = "summary"
+
+	// FormatStructured generates a categorized index (10-50KB)
+	// Contains: files grouped by domain/purpose, semantic sections
+	// Best for: agentic loops that need to understand codebase areas
+	FormatStructured OutputFormat = "structured"
+
+	// FormatFull generates the complete index (50-200KB)
+	// Contains: all files, symbols, detailed tree structure
+	// Best for: comprehensive analysis, initial exploration
+	FormatFull OutputFormat = "full"
+
+	// DefaultFormat is the default output format
+	DefaultFormat OutputFormat = FormatStructured
+)
+
+// Config represents the parsed configuration for codebase indexing
+type Config struct {
+	// Root path to scan (defaults to current directory)
+	Root string
+
+	// Output configuration
+	OutputPath    string
+	OutputFormat  OutputFormat // summary, structured, or full
+	Store         StoreLocation
+	Encrypt       bool
+	EncryptionKey string
+
+	// Expose configuration
+	ExposeVariable bool
+	MemoryEnabled  bool
+	MemoryKey      string
+
+	// Adapter overrides per language
+	AdapterOverrides map[string]*AdapterOverride
+
+	// ParserPlugins adds local executable parsers for project-specific source
+	// formats. Plugins are opt-in and run only on the machine indexing the repo.
+	ParserPlugins     []ParserPluginConfig
+	ParserPluginPaths []string
+
+	// ExtraAdapters registers in-process adapters supplied by an embedder.
+	// Unlike ParserPlugins these need no executable on disk, so a library
+	// caller can index a project-specific source format directly. Names must
+	// not collide with a built-in adapter or a parser plugin.
+	ExtraAdapters []Adapter
+
+	// Processing options
+	MaxOutputKB   int
+	HashAlgorithm HashAlgorithm
+	Incremental   bool
+	Verbose       bool
+	// SkipFileHash avoids reading source contents only to compute metadata that
+	// a caller does not consume. Graph scans use file size and modification time
+	// to validate their symbol cache, so hashing every source file is redundant.
+	SkipFileHash bool
+
+	// SymbolCache lets repeat consumers reuse symbols for unchanged files. The
+	// cache is validated against path, language, size, and hash or modification time;
+	// missing or stale entries are extracted normally.
+	SymbolCache map[string]SymbolCacheEntry
+
+	// Progress receives deterministic scan milestones. It is optional so index
+	// generation stays quiet and script-friendly unless a CLI or UI opts in.
+	Progress func(ProgressEvent)
+
+	// MaxFilesPerDir caps how many files are listed per directory in the
+	// Repository Layout tree. 0 or negative means unlimited (list every file).
+	MaxFilesPerDir int
+
+	// MaxFiles caps markdown candidate selection. Structural extraction covers
+	// all scanned files for graph consumers. 0 or negative means unlimited.
+	MaxFiles int
+
+	// Optional second-pass AI enhancement. The normal high-performance scan still
+	// runs first; when enabled, EnhancementFunc receives a bounded macro-analysis
+	// prompt and returns additional markdown insights for future agents.
+	EnhanceIndex     bool
+	EnhancementModel string
+	EnhancementFunc  func(prompt string) (string, error)
+
+	// qmd integration (optional)
+	Qmd *QmdConfig
+
+	// Derived values (computed at runtime)
+	RepoFileSlug string // lowercase slug for filenames
+	RepoVarSlug  string // uppercase slug for variables
+}
+
+// SymbolCacheEntry is the durable, content-derived portion of a file scan.
+// Index updates validate the content hash; graph-only scans can use size and
+// modification time when no hash is requested.
+type SymbolCacheEntry struct {
+	Hash     string      `json:"hash,omitempty"`
+	Language string      `json:"language"`
+	Size     int64       `json:"size"`
+	ModTime  int64       `json:"mod_time"`
+	Symbols  *SymbolInfo `json:"symbols"`
+}
+
+// ProgressEvent describes the current deterministic indexing operation.
+// Total is zero while a phase has no meaningful bounded total.
+type ProgressEvent struct {
+	Phase     string
+	Current   string
+	Completed int
+	Total     int
+}
+
+// AdapterOverride allows customization of adapter behavior
+type AdapterOverride struct {
+	IgnoreDirs      []string
+	IgnoreGlobs     []string
+	PriorityFiles   []string
+	ReplaceDefaults bool
+}
+
+// ParserPluginConfig declares a locally installed parser plugin. The command is
+// executed directly (never through a shell) once per matching source file.
+// It receives a JSON request on stdin and must write one JSON response on
+// stdout; see docs for the protocol.
+type ParserPluginConfig struct {
+	Name               string   `yaml:"name" json:"name"`
+	Command            string   `yaml:"command" json:"command"`
+	Args               []string `yaml:"args,omitempty" json:"args,omitempty"`
+	Extensions         []string `yaml:"extensions" json:"extensions"`
+	DetectionFiles     []string `yaml:"detection_files,omitempty" json:"detection_files,omitempty"`
+	IgnoreDirs         []string `yaml:"ignore_dirs,omitempty" json:"ignore_dirs,omitempty"`
+	IgnoreGlobs        []string `yaml:"ignore_globs,omitempty" json:"ignore_globs,omitempty"`
+	EntrypointPatterns []string `yaml:"entrypoint_patterns,omitempty" json:"entrypoint_patterns,omitempty"`
+	ConfigPatterns     []string `yaml:"config_patterns,omitempty" json:"config_patterns,omitempty"`
+	Priority           int      `yaml:"priority,omitempty" json:"priority,omitempty"`
+	TimeoutMS          int      `yaml:"timeout_ms,omitempty" json:"timeout_ms,omitempty"`
+}
+
+// Result represents the output of index generation
+type Result struct {
+	// The generated markdown content (primary format)
+	Content string
+
+	// Additional format outputs (generated on demand)
+	Summary    string // Always generated - compact overview for agents
+	Structured string // Categorized index if format != summary
+	Full       string // Complete index if format == full
+
+	// Path where the index was written
+	OutputPath string
+
+	// Hash of the plaintext content
+	ContentHash string
+
+	// Whether the index was updated (for incremental mode)
+	Updated bool
+
+	// Format used for Content
+	Format OutputFormat
+
+	// Metadata
+	GeneratedAt time.Time
+	RepoName    string
+	Languages   []string
+	FileCount   int
+	Duration    time.Duration
+
+	// Categorization (populated during structured/full generation)
+	Categories map[string][]string // category -> file paths
+}
+
+// ScanResult holds the results of repository scanning
+type ScanResult struct {
+	// GraphFiles contains all scanned files, independent of markdown limits.
+	GraphFiles []*FileEntry
+	// All files found (before candidate selection)
+	Files []*FileEntry
+
+	// Selected candidate files for indexing
+	Candidates []*FileEntry
+
+	// Directory structure summary
+	DirTree *DirNode
+
+	// Macro structure inferred from config files, language roots, and framework
+	// indicators. This helps monorepos expose distinct frontend/backend/mobile/CLI
+	// components instead of flattening everything into one generic file list.
+	IsMonorepo bool
+	Components []*CodebaseComponent
+
+	// Statistics
+	TotalFiles    int
+	TotalDirs     int
+	IgnoredFiles  int
+	IgnoredDirs   int
+	TotalBytes    int64
+	ProcessedTime time.Duration
+}
+
+// CodebaseComponent describes a logical app/package inside a repository. In a
+// monorepo this usually maps to a frontend, backend, worker, mobile app, CLI, or
+// shared library rooted at a subdirectory with its own manifest/config file.
+type CodebaseComponent struct {
+	Name        string
+	Root        string
+	Language    string
+	Kind        string // frontend, backend, cli, mobile, shared-library, infrastructure, unknown
+	Frameworks  []string
+	ConfigFiles []string
+	EntryPoints []string
+	KeyDirs     []string
+	FileCount   int
+	Evidence    []string
+}
+
+// FileEntry represents a single file in the repository
+type FileEntry struct {
+	// PackagePath is a repository-resolved package identity, when available.
+	PackagePath string `json:",omitempty"`
+	// Relative path from repo root
+	Path string
+
+	// File metadata
+	Size    int64
+	ModTime time.Time
+	Hash    string // xxhash or sha256 depending on config
+
+	// Token estimation (Size / 4 as rough approximation)
+	EstimatedTokens int
+
+	// Scoring
+	Score        int
+	Depth        int
+	IsEntrypoint bool
+	IsConfig     bool
+	IsGenerated  bool
+
+	// Language association
+	Language string
+
+	// Extracted symbols (populated during extraction phase)
+	Symbols *SymbolInfo
+}
+
+// TokenBudgetCategory returns the token budget category for a file
+// Uses shared thresholds from filescan package
+func (f *FileEntry) TokenBudgetCategory() string {
+	if f.EstimatedTokens < filescan.TokenThresholdSafe {
+		return "safe"
+	} else if f.EstimatedTokens < filescan.TokenThresholdLarge {
+		return "large"
+	}
+	return "oversized"
+}
+
+// DirNode represents a directory in the tree structure
+type DirNode struct {
+	Name     string
+	Path     string
+	Children []*DirNode
+	Files    []string // File names only (not full entries)
+	Depth    int
+}
+
+// SymbolInfo holds extracted symbols from a file
+type SymbolInfo struct {
+	// Package/module declaration
+	Package string
+
+	// Imports/dependencies
+	Imports []string
+
+	// Functions and methods
+	Functions []FunctionInfo
+
+	// Types (structs, classes, interfaces)
+	Types []TypeInfo
+
+	// Constants and variables
+	Constants []string
+	Variables []string
+
+	// References are resolved, language-level references to other symbols.
+	// Unlike text in a signature, these preserve qualified names such as
+	// aws_s3_bucket.logs and can therefore form precise graph edges.
+	References []string
+
+	// Framework/library indicators
+	Frameworks []string
+
+	// Risk indicators (auth, crypto, db, concurrency)
+	RiskTags []string
+}
+
+// FunctionInfo describes a function or method
+type FunctionInfo struct {
+	Name       string
+	Signature  string
+	IsExported bool
+	IsMethod   bool
+	Receiver   string // For methods
+	Comments   string
+}
+
+// TypeInfo describes a type definition
+type TypeInfo struct {
+	Name       string
+	Kind       string // struct, interface, class, enum, etc.
+	IsExported bool
+	Fields     []string
+	Methods    []string
+	Comments   string
+}
+
+// ChangeSet represents files that changed since last index
+type ChangeSet struct {
+	Added    []*FileEntry
+	Modified []*FileEntry
+	Deleted  []string
+}
+
+// DefaultConfig returns a Config with sensible defaults
+func DefaultConfig() *Config {
+	return &Config{
+		Root:           ".",
+		OutputFormat:   DefaultFormat,
+		Store:          StoreRepo,
+		Encrypt:        false,
+		ExposeVariable: true,
+		MemoryEnabled:  false,
+		MaxOutputKB:    100,
+		HashAlgorithm:  DefaultHash,
+		Incremental:    false,
+		Verbose:        false,
+		MaxFilesPerDir: DefaultMaxFilesPerDir,
+		MaxFiles:       DefaultMaxFiles,
+	}
+}

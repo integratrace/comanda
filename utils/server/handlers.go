@@ -91,16 +91,23 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 	config.VerboseLog("Processing file: %s", filename)
 	config.DebugLog("Starting process request for file: %s", filename)
 
-	// Clean the path to remove any . or .. components
+	// A bare filename belongs to the requested runtime directory when one is
+	// supplied. File uploads use the same convention: uploading workflow.yaml
+	// with runtimeDir=run-123 stores it at DataDir/run-123/workflow.yaml.
+	// Previously /process only used runtimeDir after reading the workflow, so
+	// it looked in DataDir/workflow.yaml and failed before processing began.
+	runtimeDir := r.URL.Query().Get("runtimeDir")
 	cleanPath := filepath.Clean(filename)
-
-	// Check if the path contains directory separators
 	if !strings.Contains(cleanPath, string(filepath.Separator)) {
-		// No directory specified, assume it's in the root of DataDir
-		cleanPath = filepath.Join(serverConfig.DataDir, cleanPath)
-		config.DebugLog("Using file in data directory: %s", cleanPath)
+		if runtimeDir != "" {
+			cleanPath = filepath.Join(serverConfig.DataDir, runtimeDir, cleanPath)
+			config.DebugLog("Using file in runtime directory: %s", cleanPath)
+		} else {
+			cleanPath = filepath.Join(serverConfig.DataDir, cleanPath)
+			config.DebugLog("Using file in data directory: %s", cleanPath)
+		}
 	} else {
-		// Path contains separators, prepend DataDir
+		// Paths with their own directory are already relative to DataDir.
 		cleanPath = filepath.Join(serverConfig.DataDir, cleanPath)
 		config.DebugLog("Using path with directories: %s", cleanPath)
 	}
@@ -222,9 +229,11 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 	// Log YAML content details before parsing
 	config.DebugLog("Processing YAML content: length=%d bytes", len(yamlContent))
 
-	// First unmarshal into a map to preserve step names (same as CLI)
-	var rawConfig map[string]processor.StepConfig
-	if err := yaml.Unmarshal(yamlContent, &rawConfig); err != nil {
+	// Unmarshal using the DSLConfig custom unmarshaler (same as CLI) so that
+	// ordered steps and top-level blocks (parallel, agentic-loop, loops,
+	// execute_loops, defer, workflow) are all handled correctly
+	var dslConfig processor.DSLConfig
+	if err := yaml.Unmarshal(yamlContent, &dslConfig); err != nil {
 		config.VerboseLog("Error parsing YAML: %v", err)
 		config.DebugLog("YAML parse error: content_preview='%s' error=%v", truncateString(string(yamlContent), 200), err)
 		w.WriteHeader(http.StatusBadRequest)
@@ -249,19 +258,10 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 		return
 	}
 
-	// Convert map to ordered Steps slice (same as CLI)
-	var dslConfig processor.DSLConfig
-	config.DebugLog("Converting YAML to DSL config: step_count=%d", len(rawConfig))
-	for name, stepConfig := range rawConfig {
-		config.DebugLog("Processing step: name=%s model=%v action=%v", name, stepConfig.Model, stepConfig.Action)
-		dslConfig.Steps = append(dslConfig.Steps, processor.Step{
-			Name:   name,
-			Config: stepConfig,
-		})
-	}
+	config.DebugLog("Parsed DSL config: steps=%d parallel_groups=%d loops=%d",
+		len(dslConfig.Steps), len(dslConfig.ParallelSteps), len(dslConfig.Loops))
 
 	// Get runtime directory from query parameter or calculate from path
-	runtimeDir := r.URL.Query().Get("runtimeDir")
 	if runtimeDir == "" {
 		// Calculate from path if not provided
 		runtimeDir = filepath.Dir(relPath) // Use relPath which is relative to DataDir
@@ -279,6 +279,14 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 	// Create and configure processor with runtime directory
 	config.DebugLog("Creating processor instance with validation enabled")
 	proc := processor.NewProcessor(&dslConfig, envConfig, serverConfig, true, runtimeDir)
+	projectID := r.URL.Query().Get("project")
+	if sourceRoot, err := projectSourceRoot(envConfig, projectID); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ProcessResponse{Success: false, Error: err.Error()})
+		return
+	} else if sourceRoot != "" {
+		proc.SetSourceRoot(sourceRoot)
+	}
 	config.DebugLog("Processor created successfully with config: steps=%d, runtimeDir=%s", len(dslConfig.Steps), runtimeDir)
 
 	// Handle POST input with detailed logging
@@ -359,8 +367,23 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 		proc.SetProgressWriter(progressWriter)
 		config.DebugLog("Progress writer configured on processor")
 
-		// Create context with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		// Forward stream log lines (loop iterations, context usage, tool
+		// activity) through the progress channel as structured log events
+		proc.SetStreamLogCallback(func(line string) {
+			progressWriter.WriteProgress(processor.ProgressUpdate{
+				Type:    processor.ProgressLog,
+				Message: line,
+			})
+		})
+
+		// Long-running workflows (e.g. agentic loops) can stream for a long
+		// time; clear the server's write deadline for this response and only
+		// apply a timeout if one is explicitly configured
+		rc := http.NewResponseController(w)
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+			config.DebugLog("Could not clear write deadline for streaming: %v", err)
+		}
+		ctx, cancel := streamingContext(r.Context(), serverConfig)
 		defer cancel()
 
 		// Add panic recovery for processor initialization
@@ -407,9 +430,9 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 		for {
 			select {
 			case <-ctx.Done():
-				config.DebugLog("Context timeout reached after 5 minutes")
+				config.DebugLog("Streaming context done: %v", ctx.Err())
 				if sw != nil {
-					sw.SendError(fmt.Errorf("processing timed out after 5 minutes"))
+					sw.SendError(fmt.Errorf("processing timed out after %d seconds", serverConfig.StreamTimeoutSeconds))
 				}
 				return
 			case <-r.Context().Done():
@@ -420,7 +443,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 					errMsg := fmt.Sprintf("Processing failed: %v", err)
 					config.DebugLog("Streaming error: %s", errMsg)
 					if sw != nil {
-						sw.SendError(fmt.Errorf(errMsg))
+						sw.SendError(fmt.Errorf("%s", errMsg))
 					}
 				} else {
 					config.DebugLog("Processing completed successfully")
@@ -441,19 +464,10 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 					if update.Message == "Starting workflow processing" || update.Message == "Workflow processing completed successfully" {
 						sw.SendProgress(update.Message)
 					} else {
-						// For other messages, create structured progress data
-						progressData := map[string]interface{}{
-							"message": update.Message,
-						}
-						if update.Step != nil {
-							progressData["step"] = map[string]string{
-								"name":   update.Step.Name,
-								"model":  update.Step.Model,
-								"action": update.Step.Action,
-							}
-						}
-						sw.SendProgress(progressData)
+						sw.SendProgress(buildProgressPayload(update))
 					}
+				case processor.ProgressLog:
+					sw.SendLog(update.Message)
 				case processor.ProgressOutput:
 					config.DebugLog("Received output event: %s", update.Stdout)
 					sw.SendOutput(update.Stdout)
@@ -527,4 +541,34 @@ func handleProcess(w http.ResponseWriter, r *http.Request, serverConfig *config.
 		Message: fmt.Sprintf("Successfully processed %s", filename),
 		Output:  finalOutput,
 	})
+}
+
+// streamingContext returns a context for a streaming workflow execution.
+// A timeout is applied only when streamTimeoutSeconds is configured (> 0);
+// by default long-running workflows stream until completion or client
+// disconnect (SSE heartbeats keep the connection alive).
+func streamingContext(parent context.Context, serverConfig *config.ServerConfig) (context.Context, context.CancelFunc) {
+	if serverConfig != nil && serverConfig.StreamTimeoutSeconds > 0 {
+		return context.WithTimeout(parent, time.Duration(serverConfig.StreamTimeoutSeconds)*time.Second)
+	}
+	return context.WithCancel(parent)
+}
+
+// buildProgressPayload converts a step progress update into the structured
+// JSON payload sent on SSE progress events
+func buildProgressPayload(update processor.ProgressUpdate) map[string]interface{} {
+	progressData := map[string]interface{}{
+		"message": update.Message,
+	}
+	if update.Step != nil {
+		progressData["step"] = map[string]string{
+			"name":   update.Step.Name,
+			"model":  update.Step.Model,
+			"action": update.Step.Action,
+		}
+	}
+	if update.PerformanceMetrics != nil {
+		progressData["metrics"] = update.PerformanceMetrics
+	}
+	return progressData
 }

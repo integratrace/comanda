@@ -13,6 +13,27 @@ import (
 	"github.com/kris-hansen/comanda/utils/models"
 )
 
+func (p *Processor) resolveConfiguredModel(modelName string) (string, *config.Model, error) {
+	if p.envConfig == nil {
+		return "", nil, fmt.Errorf("environment configuration is not available")
+	}
+	return p.envConfig.ResolveConfiguredModel(modelName)
+}
+
+func (p *Processor) resolveModelTarget(modelName string) string {
+	if p.envConfig == nil {
+		return modelName
+	}
+	_, model, err := p.envConfig.ResolveConfiguredModel(modelName)
+	if err != nil || model == nil {
+		return modelName
+	}
+	if model.Target != "" {
+		return model.Target
+	}
+	return model.Name
+}
+
 // --- Ollama specific types (copied from ollama.go for local check) ---
 
 // OllamaTagsResponse represents the top-level structure of Ollama's /api/tags response
@@ -62,12 +83,12 @@ func checkOllamaModelExists(modelName string) (bool, error) {
 	modelNameLower := strings.ToLower(modelName)
 	for _, model := range tagsResponse.Models {
 		modelFullName := strings.ToLower(model.Name)
-		
+
 		// First check exact match
 		if modelFullName == modelNameLower {
 			return true, nil // Model found (exact match)
 		}
-		
+
 		// Then check if the requested model matches the base name (before :tag)
 		// e.g., "gpt-oss" should match "gpt-oss:latest"
 		if strings.Contains(modelFullName, ":") {
@@ -76,9 +97,9 @@ func checkOllamaModelExists(modelName string) (bool, error) {
 				return true, nil // Model found (tag match)
 			}
 		}
-		
+
 		// Also check if the full model name starts with the requested name
-		// e.g., "llama3" should match "llama3.2:latest" 
+		// e.g., "llama3" should match "llama3.2:latest"
 		if strings.HasPrefix(modelFullName, modelNameLower) {
 			// Make sure we're not matching partial names unintentionally
 			nextChar := modelFullName[len(modelNameLower):]
@@ -95,7 +116,7 @@ func checkOllamaModelExists(modelName string) (bool, error) {
 		availableModels[i] = m.Name
 	}
 	errMsg := fmt.Sprintf("model tag '%s' not found in local Ollama instance. Available models: %v. Try running 'ollama pull %s'", modelName, availableModels, modelName)
-	return false, fmt.Errorf(errMsg)
+	return false, fmt.Errorf("%s", errMsg)
 }
 
 // validateModel checks if the specified model is supported and has the required capabilities
@@ -113,21 +134,86 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 	p.debugf("Validating %d model(s)", len(modelNames))
 	for _, modelName := range modelNames {
 		p.debugf("Starting validation for model: %s", modelName)
+		resolvedModelName := p.resolveModelTarget(modelName)
+
+		// A provider pre-registered via SetProvider is already configured;
+		// skip DetectProvider/envConfig resolution entirely when it supports
+		// this model.
+		if preConfigured := p.preConfiguredProviderFor(resolvedModelName); preConfigured != nil {
+			p.debugf("Model %s handled by pre-configured provider %s (SetProvider)", modelName, preConfigured.Name())
+			continue
+		}
+
 		p.debugf("Attempting provider detection for model: %s", modelName)
-		provider := models.DetectProvider(modelName)
+		provider := models.DetectProvider(resolvedModelName)
 		p.debugf("Provider detection result for %s: found=%v", modelName, provider != nil)
 		if provider == nil {
+			if providerName, _, err := p.resolveConfiguredModel(modelName); err == nil {
+				switch providerName {
+				case "openai":
+					provider = models.NewOpenAIProvider()
+				case "anthropic":
+					provider = models.NewAnthropicProvider()
+				case "google":
+					provider = models.NewGoogleProvider()
+				case "xai":
+					provider = models.NewXAIProvider()
+				case "deepseek":
+					provider = models.NewDeepseekProvider()
+				case "moonshot":
+					provider = models.NewMoonshotProvider()
+				case "sakana":
+					provider = models.NewSakanaProvider()
+				case "ollama":
+					provider = models.NewOllamaProvider()
+				case "vllm":
+					provider = models.NewVLLMProvider()
+				case "llama.cpp":
+					provider = models.NewLlamaCPPProvider()
+				}
+			}
+		}
+		if provider == nil {
+			// Check if this is a Claude Code model - give specific error about missing CLI
+			if models.NewClaudeCodeProvider().SupportsModel(resolvedModelName) {
+				errMsg := fmt.Sprintf("model %s requires Claude Code CLI, but 'claude' binary not found. Install Claude Code from https://claude.ai/download or ensure it's in your PATH", modelName)
+				p.debugf("Validation failed: %s", errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			// Check if this is a Gemini CLI model - give specific error about missing CLI
+			if models.NewGeminiCLIProvider().SupportsModel(resolvedModelName) {
+				errMsg := fmt.Sprintf("model %s requires Gemini CLI, but 'gemini' binary not found. Install Gemini CLI via 'npm install -g @google/gemini-cli' or ensure it's in your PATH", modelName)
+				p.debugf("Validation failed: %s", errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			// Check if this is an OpenAI Codex model - give specific error about missing CLI
+			if models.NewOpenAICodexProvider().SupportsModel(resolvedModelName) {
+				errMsg := fmt.Sprintf("model %s requires OpenAI Codex CLI, but 'codex' binary not found. Install OpenAI Codex CLI via 'npm install -g @openai/codex' or ensure it's in your PATH", modelName)
+				p.debugf("Validation failed: %s", errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			// Check if this is a Kimi Code model - give specific error about missing CLI
+			if models.NewKimiCodeProvider().SupportsModel(resolvedModelName) {
+				errMsg := fmt.Sprintf("model %s requires Kimi Code CLI, but 'kimi' binary not found. Install Kimi Code via 'npm install -g @moonshot-ai/kimi-code' or 'curl -L code.kimi.com/install.sh | bash', or ensure it's in your PATH", modelName)
+				p.debugf("Validation failed: %s", errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			if models.NewLlamaCPPProvider().SupportsModel(resolvedModelName) {
+				errMsg := fmt.Sprintf("model %s requires llama.cpp with a local .gguf file, but 'llama-cli' was not found or the GGUF file does not exist. Install llama.cpp or set LLAMA_CPP_BINARY, and verify the model path is valid", modelName)
+				p.debugf("Validation failed: %s", errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
 			errMsg := fmt.Sprintf("unsupported model: %s (no provider found)", modelName)
 			p.debugf("Validation failed: %s", errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 
 		// Check if the provider actually supports this model
-		p.debugf("Checking if provider %s supports model %s", provider.Name(), modelName)
-		if !provider.SupportsModel(modelName) {
+		p.debugf("Checking if provider %s supports model %s", provider.Name(), resolvedModelName)
+		if !provider.SupportsModel(resolvedModelName) {
 			errMsg := fmt.Sprintf("unsupported model: %s (provider %s does not support it)", modelName, provider.Name())
 			p.debugf("Validation failed: %s", errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		p.debugf("Provider %s confirmed support for model %s", provider.Name(), modelName)
 
@@ -137,7 +223,7 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 		// --- Add Ollama specific local check ---
 		if providerName == "ollama" {
 			p.debugf("Performing local check for Ollama model tag: %s", modelName)
-			exists, err := checkOllamaModelExists(modelName)
+			exists, err := checkOllamaModelExists(resolvedModelName)
 			if err != nil {
 				// Error occurred during check (e.g., connection refused, API error)
 				p.debugf("Ollama local check failed for %s: %v", modelName, err)
@@ -148,11 +234,66 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 				// The error from checkOllamaModelExists already contains the helpful message
 				p.debugf("Ollama model tag %s not found locally.", modelName)
 				// The error from checkOllamaModelExists includes the suggestion to pull
-				return fmt.Errorf("model tag '%s' not found locally via Ollama API", modelName)
+				return fmt.Errorf("model tag '%s' not found locally via Ollama API", resolvedModelName)
 			}
 			p.debugf("Ollama model tag %s confirmed to exist locally.", modelName)
 		}
 		// --- End Ollama specific check ---
+
+		// --- Skip envConfig checks for Claude Code provider ---
+		// Claude Code uses the local 'claude' binary and doesn't require API key configuration
+		if providerName == "claude-code" {
+			p.debugf("Skipping envConfig check for claude-code provider (uses local binary)")
+			provider.SetVerbose(p.verbose)
+			p.providers[provider.Name()] = provider
+			p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
+			continue
+		}
+		// --- End Claude Code specific check ---
+
+		// --- Skip envConfig checks for Gemini CLI provider ---
+		// Gemini CLI uses the local 'gemini' binary and doesn't require API key configuration here
+		if providerName == "gemini-cli" {
+			p.debugf("Skipping envConfig check for gemini-cli provider (uses local binary)")
+			provider.SetVerbose(p.verbose)
+			p.providers[provider.Name()] = provider
+			p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
+			continue
+		}
+		// --- End Gemini CLI specific check ---
+
+		// --- Skip envConfig checks for OpenAI Codex provider ---
+		// OpenAI Codex uses the local 'codex' binary and doesn't require API key configuration here
+		if providerName == "openai-codex" {
+			p.debugf("Skipping envConfig check for openai-codex provider (uses local binary)")
+			provider.SetVerbose(p.verbose)
+			p.providers[provider.Name()] = provider
+			p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
+			continue
+		}
+		// --- End OpenAI Codex specific check ---
+
+		// --- Skip envConfig checks for Kimi Code provider ---
+		// Kimi Code uses the local 'kimi' binary and doesn't require API key configuration here
+		if providerName == "kimi-code" {
+			p.debugf("Skipping envConfig check for kimi-code provider (uses local binary)")
+			provider.SetVerbose(p.verbose)
+			p.providers[provider.Name()] = provider
+			p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
+			continue
+		}
+		// --- End Kimi Code specific check ---
+
+		// --- Skip envConfig checks for llama.cpp provider ---
+		// llama.cpp uses a local GGUF model path directly and does not require API keys.
+		if providerName == "llama.cpp" {
+			p.debugf("Skipping envConfig check for llama.cpp provider (uses local GGUF path)")
+			provider.SetVerbose(p.verbose)
+			p.providers[provider.Name()] = provider
+			p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
+			continue
+		}
+		// --- End llama.cpp specific check ---
 
 		// Get model configuration from environment
 		p.debugf("Getting model configuration for %s from provider %s", modelName, providerName)
@@ -162,18 +303,18 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 			if strings.Contains(err.Error(), fmt.Sprintf("model %s not found for provider %s", modelName, providerName)) {
 				errMsg := fmt.Sprintf("model %s is supported by provider %s but is not enabled in your configuration. Use 'comanda configure' to add it.", modelName, providerName)
 				p.debugf("Configuration error: %s", errMsg)
-				return fmt.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
 			// Otherwise, return the original configuration error
 			errMsg := fmt.Sprintf("failed to get model configuration for %s: %v", modelName, err)
 			p.debugf("Configuration error: %s", errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		p.debugf("Successfully retrieved model configuration for %s", modelName)
 
 		// Check if model has required capabilities based on input types
 		for _, input := range inputs {
-			if input == "NA" || input == "STDIN" {
+			if input == "NA" || input == InputSTDIN {
 				continue
 			}
 
@@ -195,25 +336,79 @@ func (p *Processor) validateModel(modelNames []string, inputs []string) error {
 
 		provider.SetVerbose(p.verbose)
 		// Store provider by provider name instead of model name
+		p.mu.Lock()
 		p.providers[provider.Name()] = provider
+		p.mu.Unlock()
 		p.debugf("Model %s is supported by provider %s", modelName, provider.Name())
 	}
 	return nil
+}
+
+// preConfiguredProviderFor returns the provider registered via SetProvider
+// that supports modelName, or nil if none was registered.
+func (p *Processor) preConfiguredProviderFor(modelName string) models.Provider {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for name := range p.preConfiguredNames {
+		if provider, ok := p.providers[name]; ok && provider.SupportsModel(modelName) {
+			return provider
+		}
+	}
+	return nil
+}
+
+// localProviders lists providers that use local binaries and don't require API keys.
+// Add new local provider names here as needed.
+var localProviders = map[string]bool{
+	"ollama":       true,
+	"llama.cpp":    true,
+	"claude-code":  true,
+	"gemini-cli":   true,
+	"openai-codex": true,
+	"kimi-code":    true,
+}
+
+// isLocalProvider checks if a provider uses local configuration (no API key needed)
+func isLocalProvider(name string) bool {
+	return localProviders[name]
 }
 
 // configureProviders sets up all detected providers with API keys
 func (p *Processor) configureProviders() error {
 	p.debugf("Configuring providers")
 
-	for providerName, provider := range p.providers {
+	// Copy providers map to avoid race conditions during iteration
+	p.mu.Lock()
+	providersCopy := make(map[string]models.Provider, len(p.providers))
+	for k, v := range p.providers {
+		providersCopy[k] = v
+	}
+	p.mu.Unlock()
+
+	for providerName, provider := range providersCopy {
 		p.debugf("Configuring provider %s", providerName)
 
-		// Handle Ollama provider separately since it doesn't need an API key, but expects "LOCAL"
-		if providerName == "ollama" {
-			if err := provider.Configure("LOCAL"); err != nil { // Pass "LOCAL" as expected by OllamaProvider.Configure
+		// Providers injected via SetProvider are already configured by the caller
+		if p.preConfiguredNames[providerName] {
+			p.debugf("Skipping envConfig setup for pre-configured provider %s", providerName)
+			continue
+		}
+
+		// Handle local providers (no API key needed, use "LOCAL" configuration)
+		if isLocalProvider(providerName) {
+			if err := provider.Configure("LOCAL"); err != nil {
 				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 			}
 			p.debugf("Successfully configured local provider %s", providerName)
+			continue
+		}
+
+		// Handle Bedrock (uses the AWS credential chain, not an api_key)
+		if providerName == "bedrock" {
+			if err := provider.Configure(""); err != nil {
+				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+			}
+			p.debugf("Successfully configured Bedrock provider (using AWS credential chain)")
 			continue
 		}
 
@@ -233,6 +428,8 @@ func (p *Processor) configureProviders() error {
 			providerConfig, err = p.envConfig.GetProviderConfig("deepseek")
 		case "moonshot":
 			providerConfig, err = p.envConfig.GetProviderConfig("moonshot")
+		case "sakana":
+			providerConfig, err = p.envConfig.GetProviderConfig("sakana")
 		default:
 			return fmt.Errorf("unknown provider: %s", providerName)
 		}

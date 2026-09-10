@@ -8,10 +8,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -46,15 +46,47 @@ type DatabaseConfig struct {
 
 // Model represents a single model configuration
 type Model struct {
-	Name  string      `yaml:"name"`
-	Type  string      `yaml:"type"`
-	Modes []ModelMode `yaml:"modes"`
+	Name   string      `yaml:"name"`
+	Target string      `yaml:"target,omitempty"`
+	Type   string      `yaml:"type"`
+	Modes  []ModelMode `yaml:"modes"`
 }
 
 // Provider represents a provider's configuration
 type Provider struct {
-	APIKey string  `yaml:"api_key"`
-	Models []Model `yaml:"models"`
+	APIKey            string  `yaml:"api_key"`
+	Models            []Model `yaml:"models"`
+	SupportsWorktrees bool    `yaml:"supports_worktrees,omitempty"`
+}
+
+// ToolConfig represents global tool execution settings
+type ToolConfig struct {
+	Allowlist []string `yaml:"allowlist,omitempty"` // Additional commands to allow globally
+	Denylist  []string `yaml:"denylist,omitempty"`  // Additional commands to deny globally
+	Timeout   int      `yaml:"timeout,omitempty"`   // Default timeout in seconds (0 = use system default of 30)
+}
+
+// SecurityConfig represents global security settings
+type SecurityConfig struct {
+	AllowAgenticTools bool `yaml:"allow_agentic_tools"` // Allow agentic tool use in loops (default true)
+}
+
+// IndexEntry represents a registered codebase index
+type IndexEntry struct {
+	Path        string `yaml:"path"`                // Source repository path
+	IndexPath   string `yaml:"index_path"`          // Where index file is stored
+	LastIndexed string `yaml:"last_indexed"`        // ISO8601 timestamp
+	ContentHash string `yaml:"content_hash"`        // Hash of index content
+	Format      string `yaml:"format"`              // summary, structured, full
+	FileCount   int    `yaml:"file_count"`          // Number of files indexed
+	SizeBytes   int64  `yaml:"size_bytes"`          // Size of index file
+	VarPrefix   string `yaml:"var_prefix"`          // Variable prefix for workflows
+	Encrypted   bool   `yaml:"encrypted,omitempty"` // Whether index is encrypted
+	Languages   string `yaml:"languages,omitempty"` // Detected languages
+	// ParserPluginManifests are local paths used when the index was captured.
+	// They contain launch configuration only; private parser source stays out of
+	// Comanda's registry and repository.
+	ParserPluginManifests []string `yaml:"parser_plugin_manifests,omitempty"`
 }
 
 // EnvConfig represents the complete environment configuration
@@ -62,7 +94,12 @@ type EnvConfig struct {
 	Providers              map[string]*Provider      `yaml:"providers"` // Changed to store pointers to Provider
 	Server                 *ServerConfig             `yaml:"server,omitempty"`
 	Databases              map[string]DatabaseConfig `yaml:"databases,omitempty"` // Added database configurations
+	Tool                   *ToolConfig               `yaml:"tool,omitempty"`      // Global tool execution settings
+	Security               *SecurityConfig           `yaml:"security,omitempty"`  // Global security settings
+	Indexes                map[string]*IndexEntry    `yaml:"indexes,omitempty"`   // Registered codebase indexes
 	DefaultGenerationModel string                    `yaml:"default_generation_model,omitempty"`
+	MemoryFile             string                    `yaml:"memory_file,omitempty"`          // Path to COMANDA.md memory file
+	IndexEncryptionKey     string                    `yaml:"index_encryption_key,omitempty"` // Key for encrypting codebase indexes
 }
 
 // Verbose indicates whether verbose logging is enabled
@@ -74,32 +111,105 @@ var Debug bool
 // DebugLog prints debug information if debug mode is enabled
 func DebugLog(format string, args ...interface{}) {
 	if Debug {
-		fmt.Printf("[DEBUG] "+format+"\n", args...)
+		log.Printf("[DEBUG] "+format+"\n", args...)
 	}
 }
 
 // VerboseLog prints verbose information if verbose mode is enabled
 func VerboseLog(format string, args ...interface{}) {
 	if Verbose {
-		fmt.Printf("[VERBOSE] "+format+"\n", args...)
+		log.Printf("[VERBOSE] "+format+"\n", args...)
 	}
 }
 
-// GetEnvPath returns the environment file path from COMANDA_ENV or the default
+// GetComandaDir returns the path to the .comanda directory in the user's home
+func GetComandaDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(homeDir, ".comanda"), nil
+}
+
+// EnsureComandaDir creates the ~/.comanda directory if it doesn't exist
+func EnsureComandaDir() (string, error) {
+	comandaDir, err := GetComandaDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(comandaDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create .comanda directory: %w", err)
+	}
+	return comandaDir, nil
+}
+
+// GetLoopStateDir returns the path to the loop-states directory
+func GetLoopStateDir() (string, error) {
+	comandaDir, err := GetComandaDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(comandaDir, "loop-states"), nil
+}
+
+// EnsureLoopStateDir creates the ~/.comanda/loop-states directory if it doesn't exist
+func EnsureLoopStateDir() (string, error) {
+	loopStateDir, err := GetLoopStateDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(loopStateDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create loop-states directory: %w", err)
+	}
+	return loopStateDir, nil
+}
+
+// GetEnvPath returns the environment file path, checking in order:
+// 1. COMANDA_ENV environment variable (explicit override)
+// 2. ~/.comanda/config.yaml (preferred default)
+// 3. .env in current directory (legacy fallback)
 func GetEnvPath() string {
+	// 1. Check for explicit override via environment variable
 	if envPath := os.Getenv("COMANDA_ENV"); envPath != "" {
 		DebugLog("Using environment file from COMANDA_ENV: %s", envPath)
 		return envPath
 	}
+
+	// 2. Check for ~/.comanda/config.yaml (preferred default)
+	comandaDir, err := GetComandaDir()
+	if err == nil {
+		configPath := filepath.Join(comandaDir, "config.yaml")
+		if _, err := os.Stat(configPath); err == nil {
+			DebugLog("Using config file: %s", configPath)
+			return configPath
+		}
+	}
+
+	// 3. Check for legacy .env file in current directory
+	if _, err := os.Stat(".env"); err == nil {
+		DebugLog("Using legacy environment file: .env")
+		return ".env"
+	}
+
+	// 4. Default to new location (will be created on first configure)
+	if comandaDir != "" {
+		return filepath.Join(comandaDir, "config.yaml")
+	}
+
+	// Fallback if home dir not available
 	DebugLog("Using default environment file: .env")
 	return ".env"
 }
 
 // PromptPassword prompts the user for a password securely
 func PromptPassword(prompt string) (string, error) {
-	fmt.Print(prompt)
-	password, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println() // Add newline after password input
+	// Check if stdin is a terminal - if not, we can't read passwords interactively
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("cannot read password: stdin is not a terminal (non-interactive environment)")
+	}
+	log.Printf("%s", prompt)
+	password, err := term.ReadPassword(int(os.Stdin.Fd()))
+	log.Printf("\n") // Add newline after password input
 	if err != nil {
 		return "", fmt.Errorf("error reading password: %w", err)
 	}
@@ -318,6 +428,15 @@ func SaveEnvConfig(path string, config *EnvConfig) error {
 		return fmt.Errorf("error marshaling env config: %w", err)
 	}
 
+	// Ensure parent directory exists
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			DebugLog("Error creating directory %s: %v", dir, err)
+			return fmt.Errorf("error creating directory: %w", err)
+		}
+	}
+
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		DebugLog("Error writing environment file: %v", err)
 		return fmt.Errorf("error writing env file: %w", err)
@@ -429,10 +548,32 @@ func (c *EnvConfig) AddModelToProvider(providerName string, model Model) error {
 		return fmt.Errorf("provider %s not found", providerName)
 	}
 
-	// Check if model already exists
+	model.Name = strings.TrimSpace(model.Name)
+	model.Target = strings.TrimSpace(model.Target)
+	if model.Name == "" {
+		return fmt.Errorf("model name is required")
+	}
+	if model.Target == "" {
+		model.Target = model.Name
+	}
+
+	// Enforce globally unique configured names so aliases remain unambiguous.
+	for existingProviderName, existingProvider := range c.Providers {
+		for _, existingModel := range existingProvider.Models {
+			if existingModel.Name == model.Name {
+				return fmt.Errorf("model %s already exists for provider %s", model.Name, existingProviderName)
+			}
+		}
+	}
+
+	// Check if model target already exists for this provider.
 	for _, m := range provider.Models {
-		if m.Name == model.Name {
-			return fmt.Errorf("model %s already exists for provider %s", model.Name, providerName)
+		existingTarget := m.Target
+		if existingTarget == "" {
+			existingTarget = m.Name
+		}
+		if existingTarget == model.Target {
+			return fmt.Errorf("model target %s already exists for provider %s", model.Target, providerName)
 		}
 	}
 
@@ -456,31 +597,36 @@ func (c *EnvConfig) GetModelConfig(providerName, modelName string) (*Model, erro
 
 	var exactMatch *Model
 	var baseMatches []*Model
-	
+
 	for _, model := range provider.Models {
+		target := model.Target
+		if target == "" {
+			target = model.Name
+		}
+
 		// Check for exact match first
-		if model.Name == modelName {
+		if model.Name == modelName || target == modelName {
 			exactMatch = &model
 			break
 		}
-		
+
 		// Check if this model matches the base name (before any tag)
-		modelBaseName := strings.Split(model.Name, ":")[0]
+		modelBaseName := strings.Split(target, ":")[0]
 		if modelBaseName == modelName {
 			baseMatches = append(baseMatches, &model)
 		}
 	}
-	
+
 	// Return exact match if found
 	if exactMatch != nil {
 		return exactMatch, nil
 	}
-	
+
 	// If no exact match but exactly one base name match, use that
 	if len(baseMatches) == 1 {
 		return baseMatches[0], nil
 	}
-	
+
 	// If multiple base name matches, it's ambiguous
 	if len(baseMatches) > 1 {
 		var modelNames []string
@@ -491,6 +637,39 @@ func (c *EnvConfig) GetModelConfig(providerName, modelName string) (*Model, erro
 	}
 
 	return nil, fmt.Errorf("model %s not found for provider %s", modelName, providerName)
+}
+
+// ResolveConfiguredModel finds a configured model by its user-facing name across all providers.
+func (c *EnvConfig) ResolveConfiguredModel(modelName string) (string, *Model, error) {
+	var matchedProvider string
+	var matchedModel *Model
+
+	for providerName, provider := range c.Providers {
+		for _, model := range provider.Models {
+			target := model.Target
+			if target == "" {
+				target = model.Name
+			}
+
+			if model.Name == modelName || target == modelName {
+				if matchedModel != nil {
+					return "", nil, fmt.Errorf("ambiguous configured model %s", modelName)
+				}
+				modelCopy := model
+				if modelCopy.Target == "" {
+					modelCopy.Target = modelCopy.Name
+				}
+				matchedProvider = providerName
+				matchedModel = &modelCopy
+			}
+		}
+	}
+
+	if matchedModel == nil {
+		return "", nil, fmt.Errorf("configured model %s not found", modelName)
+	}
+
+	return matchedProvider, matchedModel, nil
 }
 
 // UpdateAPIKey updates the API key for a specific provider
@@ -568,6 +747,26 @@ func (c *DatabaseConfig) GetConnectionString() string {
 	default:
 		return ""
 	}
+}
+
+// GetToolConfig returns the global tool configuration, or nil if not set
+func (c *EnvConfig) GetToolConfig() *ToolConfig {
+	return c.Tool
+}
+
+// SetToolConfig sets the global tool configuration
+func (c *EnvConfig) SetToolConfig(tool *ToolConfig) {
+	c.Tool = tool
+}
+
+// IsAgenticToolsAllowed returns whether agentic tool use is allowed globally.
+// When enabled (the default), agents can execute shell commands and write files
+// within allowed_paths. Set security.allow_agentic_tools: false to disable.
+func (c *EnvConfig) IsAgenticToolsAllowed() bool {
+	if c.Security == nil {
+		return true // default enabled for dev convenience
+	}
+	return c.Security.AllowAgenticTools
 }
 
 // GetAllConfiguredModels returns a list of all configured models across all providers

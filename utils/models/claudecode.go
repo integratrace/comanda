@@ -1,0 +1,546 @@
+package models
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/kris-hansen/comanda/utils/config"
+	"github.com/kris-hansen/comanda/utils/fileutil"
+	"github.com/kris-hansen/comanda/utils/retry"
+)
+
+// claudeCodeJSONEnvelope mirrors the shape returned by `claude --output-format json`.
+// Only the fields we actually consume are declared.
+type claudeCodeJSONEnvelope struct {
+	Result string `json:"result"`
+}
+
+// extractClaudeCodeResult unwraps the JSON envelope produced by `--output-format json`
+// and returns just the agent's `result` text. Returns the input unchanged if it doesn't
+// look like the envelope (so non-JSON callers and future format changes degrade safely).
+//
+// This matters because downstream pattern matching (loop exit conditions) and file
+// outputs would otherwise see metadata like `"contextWindow":200000` and treat it as
+// agent prose — yielding spurious exits and unreadable log files.
+func extractClaudeCodeResult(stdout string) string {
+	trimmed := strings.TrimSpace(stdout)
+	if trimmed == "" || trimmed[0] != '{' {
+		return stdout
+	}
+	var env claudeCodeJSONEnvelope
+	if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
+		return stdout
+	}
+	if env.Result == "" {
+		return stdout
+	}
+	return env.Result
+}
+
+// ClaudeCodeProvider handles Claude Code CLI for agentic programming tasks
+type ClaudeCodeProvider struct {
+	verbose           bool
+	binaryPath        string
+	debugFile         string // Optional debug file path for streaming output
+	worktree          string // Optional worktree name for isolated execution
+	worktreeSupported *bool  // Cached result of worktree flag probe
+	mu                sync.Mutex
+}
+
+// ClaudeCodeProvider implements the agentic provider capabilities.
+var (
+	_ AgenticProvider = (*ClaudeCodeProvider)(nil)
+	_ DebugFileSetter = (*ClaudeCodeProvider)(nil)
+	_ WorktreeSetter  = (*ClaudeCodeProvider)(nil)
+)
+
+// NewClaudeCodeProvider creates a new Claude Code provider instance
+func NewClaudeCodeProvider() *ClaudeCodeProvider {
+	return &ClaudeCodeProvider{}
+}
+
+// Name returns the provider name
+func (c *ClaudeCodeProvider) Name() string {
+	return "claude-code"
+}
+
+// debugf prints debug information if verbose mode is enabled (thread-safe)
+func (c *ClaudeCodeProvider) debugf(format string, args ...interface{}) {
+	if c.verbose {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		log.Printf("[DEBUG][ClaudeCode] "+format+"\n", args...)
+	}
+}
+
+// SupportsModel checks if this provider supports the given model name
+func (c *ClaudeCodeProvider) SupportsModel(modelName string) bool {
+	c.debugf("Checking if model is supported: %s", modelName)
+
+	// Support claude-code as the primary model name
+	// Also support variations like claude-code-sonnet, claude-code-opus
+	modelLower := strings.ToLower(modelName)
+	supported := modelLower == "claude-code" ||
+		strings.HasPrefix(modelLower, "claude-code-")
+
+	if supported {
+		c.debugf("Model %s is supported by Claude Code provider", modelName)
+	}
+	return supported
+}
+
+// Configure sets up the provider
+// Claude Code uses its own authentication, so we accept "LOCAL" or empty
+func (c *ClaudeCodeProvider) Configure(apiKey string) error {
+	c.debugf("Configuring Claude Code provider")
+
+	// Find the claude binary
+	binaryPath, err := c.findClaudeBinary()
+	if err != nil {
+		return fmt.Errorf("claude binary not found: %w", err)
+	}
+	c.binaryPath = binaryPath
+	c.debugf("Found claude binary at: %s", binaryPath)
+
+	return nil
+}
+
+// findClaudeBinary locates the claude CLI binary
+func (c *ClaudeCodeProvider) findClaudeBinary() (string, error) {
+	// First check if it's in PATH
+	path, err := exec.LookPath("claude")
+	if err == nil {
+		return path, nil
+	}
+
+	// Check common installation locations
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not find home directory: %w", err)
+	}
+
+	commonPaths := []string{
+		filepath.Join(homeDir, ".claude", "local", "claude"),
+		filepath.Join(homeDir, ".local", "bin", "claude"),
+		"/usr/local/bin/claude",
+		"/usr/bin/claude",
+	}
+
+	for _, p := range commonPaths {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf("claude binary not found in PATH or common locations")
+}
+
+// SendPrompt sends a prompt to Claude Code and returns the response
+func (c *ClaudeCodeProvider) SendPrompt(modelName string, prompt string) (string, error) {
+	c.debugf("Preparing to send prompt via Claude Code")
+	c.debugf("Prompt length: %d characters", len(prompt))
+
+	if c.binaryPath == "" {
+		if err := c.Configure("LOCAL"); err != nil {
+			return "", err
+		}
+	}
+
+	// Keep prompt content on stdin rather than in argv. Besides avoiding prompt
+	// leakage in process listings, this allows indexes and other large inputs to
+	// exceed the operating system's command-line argument limit.
+	args := c.buildArgs(modelName)
+
+	c.debugf("Executing: %s %v", c.binaryPath, args)
+
+	// Use retry mechanism for execution
+	result, err := retry.WithRetry(
+		func() (interface{}, error) {
+			return c.executeCommand(args, prompt, "")
+		},
+		retry.IsTransient,
+		retry.DefaultRetryConfig,
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	response := result.(string)
+	c.debugf("Command completed, response length: %d characters", len(response))
+	return response, nil
+}
+
+// SendPromptWithFile sends a prompt along with file context to Claude Code
+func (c *ClaudeCodeProvider) SendPromptWithFile(modelName string, prompt string, file FileInput) (string, error) {
+	c.debugf("Preparing to send prompt with file to Claude Code")
+	c.debugf("File path: %s", file.Path)
+
+	if c.binaryPath == "" {
+		if err := c.Configure("LOCAL"); err != nil {
+			return "", err
+		}
+	}
+
+	// Read file content
+	fileData, err := fileutil.SafeReadFile(file.Path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// For text files, include content in prompt
+	// For binary/image files, we'd need different handling
+	fileContent := string(fileData)
+	combinedPrompt := fmt.Sprintf("File: %s\n\n```\n%s\n```\n\nTask: %s", file.Path, fileContent, prompt)
+
+	// Build args - use the file's directory as working directory
+	args := c.buildArgs(modelName)
+
+	c.debugf("Executing with file context: %s", file.Path)
+
+	result, err := retry.WithRetry(
+		func() (interface{}, error) {
+			return c.executeCommand(args, combinedPrompt, filepath.Dir(file.Path))
+		},
+		retry.IsTransient,
+		retry.DefaultRetryConfig,
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	response := result.(string)
+	c.debugf("Command completed, response length: %d characters", len(response))
+	return response, nil
+}
+
+// SendPromptAgentic sends a prompt with full tool access for agentic mode
+func (c *ClaudeCodeProvider) SendPromptAgentic(modelName string, prompt string, allowedPaths []string, tools []string, workDir string) (string, error) {
+	c.debugf("Preparing to send agentic prompt via Claude Code")
+	c.debugf("Prompt length: %d characters, allowed paths: %v, tools: %v", len(prompt), allowedPaths, tools)
+
+	// Expand paths (handle ~, $HOME, etc.) before validation
+	expandedPaths, err := fileutil.ExpandPaths(allowedPaths)
+	if err != nil {
+		return "", fmt.Errorf("failed to expand allowed_paths: %w", err)
+	}
+
+	// Validate all allowed paths exist (do this first to fail fast on bad config)
+	var missingPaths []string
+	for i, path := range expandedPaths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			missingPaths = append(missingPaths, fmt.Sprintf("%s (expanded from %s)", path, allowedPaths[i]))
+		}
+	}
+	if len(missingPaths) > 0 {
+		return "", fmt.Errorf("allowed_path(s) do not exist:\n  • %s\n\n💡 Tip: If allowed_paths is empty, comanda will auto-infer from the workflow directory or cwd",
+			strings.Join(missingPaths, "\n  • "))
+	}
+
+	// Use expanded paths from here on
+	allowedPaths = expandedPaths
+
+	if c.binaryPath == "" {
+		if err := c.Configure("LOCAL"); err != nil {
+			return "", err
+		}
+	}
+
+	// Build agentic args. Send the prompt on stdin, not as a positional
+	// argument, so large loop context does not exceed ARG_MAX.
+	args := c.buildArgsAgentic(modelName, allowedPaths, tools)
+
+	c.debugf("Executing agentic: %s %v", c.binaryPath, args)
+
+	// Use retry mechanism for execution
+	result, err := retry.WithRetry(
+		func() (interface{}, error) {
+			return c.executeCommand(args, prompt, workDir)
+		},
+		retry.IsTransient,
+		retry.DefaultRetryConfig,
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	response := extractClaudeCodeResult(result.(string))
+	c.debugf("Agentic command completed, response length: %d characters", len(response))
+	return response, nil
+}
+
+// getModelFlag returns the --model flag value for a given model name, or empty string if none needed
+func (c *ClaudeCodeProvider) getModelFlag(modelName string) string {
+	if !strings.HasPrefix(strings.ToLower(modelName), "claude-code-") {
+		return ""
+	}
+	variant := strings.TrimPrefix(strings.ToLower(modelName), "claude-code-")
+	switch variant {
+	case "opus":
+		return "claude-opus-4-5-20251101"
+	case "sonnet":
+		return "claude-sonnet-4-5-20250929"
+	case "haiku":
+		return "claude-haiku-4-5-20251001"
+	default:
+		if strings.Contains(variant, "-") {
+			return variant
+		}
+		return ""
+	}
+}
+
+// buildArgs constructs command-line arguments for Claude's non-interactive
+// mode. The prompt is deliberately supplied on stdin by executeCommand.
+func (c *ClaudeCodeProvider) buildArgs(modelName string) []string {
+	args := []string{
+		"--print", // Non-interactive mode, just print the response
+	}
+
+	if model := c.getModelFlag(modelName); model != "" {
+		args = append(args, "--model", model)
+	}
+
+	return args
+}
+
+// resolvePath expands ~ to home directory and resolves to absolute path
+func resolvePath(path string) string {
+	// Expand ~ to home directory
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	} else if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = home
+		}
+	}
+
+	// Resolve to absolute path
+	if absPath, err := filepath.Abs(path); err == nil {
+		return absPath
+	}
+	return path
+}
+
+// buildArgsAgentic constructs command line arguments for agentic mode.
+// It uses -p (print mode) with explicit tool permissions for deterministic
+// subprocess behavior; executeCommand supplies the prompt on stdin.
+func (c *ClaudeCodeProvider) buildArgsAgentic(modelName string, allowedPaths []string, tools []string) []string {
+	// Start with -p for subprocess/one-shot mode and for subprocess mode
+	// Note: --bare was removed as it breaks auth on some Claude Code versions
+	args := []string{"-p"}
+
+	// Add debug file for streaming visibility into tool calls
+	if c.debugFile != "" {
+		c.debugf("Adding --debug-file flag: %s", c.debugFile)
+		args = append(args, "--debug-file", c.debugFile)
+	} else {
+		c.debugf("No debug file set for agentic mode")
+	}
+
+	// Add worktree for isolated execution (only if flag is supported)
+	if c.worktree != "" && c.SupportsWorktreeFlag() {
+		c.debugf("Adding --worktree flag: %s", c.worktree)
+		args = append(args, "--worktree", c.worktree)
+	} else if c.worktree != "" {
+		c.debugf("Worktree requested but --worktree flag not supported, using workDir fallback")
+	}
+
+	// Add allowed paths for tool access scope
+	// Resolve paths to absolute (expands ~ and converts relative to absolute)
+	for _, path := range allowedPaths {
+		resolvedPath := resolvePath(path)
+		c.debugf("Resolved allowed path: %s -> %s", path, resolvedPath)
+		args = append(args, "--add-dir", resolvedPath)
+	}
+
+	// Permission strategy for non-interactive agentic use:
+	// In -p mode, --allowedTools is REQUIRED to pre-approve tools (otherwise Claude
+	// tries to use them and fails with "Claude requested permissions to use X").
+	// --dangerously-skip-permissions alone is not sufficient in -p mode.
+	if len(allowedPaths) > 0 {
+		args = append(args, "--dangerously-skip-permissions")
+
+		// Always pass --allowedTools - required for -p mode to work
+		// Use specified tools or default set for agentic coding
+		var allowedTools []string
+		if len(tools) > 0 {
+			allowedTools = tools
+		} else {
+			// Default tool set: Read, Write, Edit, Glob, Grep, Bash
+			allowedTools = []string{"Read", "Write", "Edit", "Glob", "Grep", "Bash"}
+		}
+		args = append(args, "--allowedTools", strings.Join(allowedTools, ","))
+	}
+
+	// Output as JSON for structured parsing
+	args = append(args, "--output-format", "json")
+
+	if model := c.getModelFlag(modelName); model != "" {
+		args = append(args, "--model", model)
+	}
+
+	return args
+}
+
+// executeCommand runs the claude binary and captures output
+func (c *ClaudeCodeProvider) executeCommand(args []string, prompt string, workDir string) (string, error) {
+	cmd := exec.Command(c.binaryPath, args...)
+	// `claude --print` accepts piped input. Keeping prompts off argv avoids the
+	// OS command-line size cap for large file inputs and loop state.
+	cmd.Stdin = strings.NewReader(prompt)
+
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	c.debugf("Starting claude command in %s", workDir)
+	startTime := time.Now()
+
+	// Set a generous timeout for agentic tasks
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	// Progress ticker - log every 30 seconds
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// 30 minute timeout for complex tasks (increased from 10)
+	timeout := 30 * time.Minute
+	for {
+		select {
+		case err := <-done:
+			elapsed := time.Since(startTime).Round(time.Second)
+			if err != nil {
+				stderrStr := stderr.String()
+				stdoutStr := stdout.String()
+				c.debugf("Command failed after %v: %v, stdout: %s, stderr: %s", elapsed, err, stdoutStr, stderrStr)
+				return "", formatClaudeCommandError(err, stdoutStr, stderrStr)
+			}
+			c.debugf("Command completed successfully in %v", elapsed)
+			return stdout.String(), nil
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Round(time.Second)
+			stdoutLen := stdout.Len()
+			stderrLen := stderr.Len()
+			c.debugf("Claude still running... %v elapsed (stdout: %d bytes, stderr: %d bytes)", elapsed, stdoutLen, stderrLen)
+		case <-time.After(timeout):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			return "", fmt.Errorf("claude command timed out after %v", timeout)
+		}
+	}
+}
+
+// formatClaudeCommandError preserves Claude Code's structured result payload.
+// In --output-format json mode the CLI commonly reports authentication, model,
+// and context failures on stdout while leaving stderr empty.
+func formatClaudeCommandError(commandErr error, stdout, stderr string) error {
+	message := strings.TrimSpace(stdout)
+	if message != "" {
+		var envelope struct {
+			Result         string `json:"result"`
+			APIErrorStatus int    `json:"api_error_status"`
+		}
+		if json.Unmarshal([]byte(message), &envelope) == nil && strings.TrimSpace(envelope.Result) != "" {
+			if envelope.APIErrorStatus != 0 {
+				message = fmt.Sprintf("API error %d: %s", envelope.APIErrorStatus, envelope.Result)
+			} else {
+				message = envelope.Result
+			}
+		}
+	}
+	if message == "" {
+		message = strings.TrimSpace(stderr)
+	}
+	if message == "" {
+		message = "no diagnostic output"
+	}
+	return fmt.Errorf("claude command failed: %w: %s", commandErr, message)
+}
+
+// SetVerbose enables or disables verbose mode
+func (c *ClaudeCodeProvider) SetVerbose(verbose bool) {
+	c.verbose = verbose
+}
+
+// SetDebugFile sets the path for claude-code's debug output
+// This enables --debug-file which streams tool calls and execution details
+func (c *ClaudeCodeProvider) SetDebugFile(path string) {
+	c.debugFile = path
+}
+
+// SetWorktree sets the worktree name for isolated execution
+// This enables --worktree which runs Claude Code in an isolated Git worktree
+func (c *ClaudeCodeProvider) SetWorktree(name string) {
+	c.worktree = name
+}
+
+// ClearWorktree clears the worktree setting
+func (c *ClaudeCodeProvider) ClearWorktree() {
+	c.worktree = ""
+}
+
+// SupportsWorktreeFlag probes if Claude Code CLI supports the --worktree flag
+// Result is cached after first probe
+func (c *ClaudeCodeProvider) SupportsWorktreeFlag() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Return cached result if available
+	if c.worktreeSupported != nil {
+		return *c.worktreeSupported
+	}
+
+	// Probe by checking --help output for --worktree
+	supported := false
+	if c.binaryPath != "" {
+		cmd := exec.Command(c.binaryPath, "--help")
+		output, err := cmd.Output()
+		if err == nil {
+			supported = strings.Contains(string(output), "--worktree")
+		}
+	}
+
+	c.worktreeSupported = &supported
+	if c.verbose {
+		log.Printf("[DEBUG][ClaudeCode] Worktree flag probe: supported=%v\n", supported)
+	}
+	return supported
+}
+
+// ValidateModel checks if the model is valid for Claude Code
+func (c *ClaudeCodeProvider) ValidateModel(modelName string) bool {
+	return c.SupportsModel(modelName)
+}
+
+// IsClaudeCodeAvailable checks if the claude binary is available on the system
+func IsClaudeCodeAvailable() bool {
+	provider := NewClaudeCodeProvider()
+	_, err := provider.findClaudeBinary()
+	if err != nil {
+		config.DebugLog("[Provider] Claude Code binary not found: %v", err)
+		return false
+	}
+	config.DebugLog("[Provider] Claude Code binary is available")
+	return true
+}

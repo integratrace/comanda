@@ -5,27 +5,119 @@ import (
 	"strings"
 
 	"github.com/kris-hansen/comanda/utils/models"
+	"gopkg.in/yaml.v3"
 )
 
-// GetEmbeddedLLMGuide returns the Comanda YAML DSL Guide for LLM consumption
-// with the current supported models injected
+// GetEmbeddedLLMGuide returns the compact, always-on generation contract with
+// the current supported models injected from the registry.
 func GetEmbeddedLLMGuide() string {
 	// Get all models from the registry
 	registry := models.GetRegistry()
 	allModels := registry.GetAllModelsList()
 
-	// Format the models as a comma-separated list with code formatting
-	modelsList := formatModelsList(allModels)
+	return GetGenerationGuideWithModels(allModels, "")
+}
 
-	// Replace the models section in the guide
-	guide := strings.Replace(
-		embeddedLLMGuideTemplate,
-		"{{SUPPORTED_MODELS}}",
-		modelsList,
-		1,
-	)
+// GetEmbeddedLLMGuideWithModels is kept for callers that need only the base
+// contract. Request-aware callers should use GetGenerationGuideWithModels.
+func GetEmbeddedLLMGuideWithModels(availableModels []string) string {
+	return GetGenerationGuideWithModels(availableModels, "")
+}
 
-	return guide
+// ValidateWorkflowModels parses a workflow YAML and validates that all model
+// references are in the list of available models. Returns a list of invalid
+// model names found, or nil if all models are valid.
+func ValidateWorkflowModels(yamlContent string, availableModels []string) []string {
+	if len(availableModels) == 0 {
+		// No validation possible without a list of available models
+		return nil
+	}
+
+	// Create a set for fast lookup
+	validModels := make(map[string]bool)
+	for _, m := range availableModels {
+		validModels[strings.ToLower(m)] = true
+	}
+
+	// Parse the YAML into a generic map structure
+	var workflow map[string]interface{}
+	if err := yaml.Unmarshal([]byte(yamlContent), &workflow); err != nil {
+		// If we can't parse, we can't validate - let runtime handle it
+		return nil
+	}
+
+	var invalidModels []string
+	seen := make(map[string]bool) // Avoid duplicates
+
+	// Walk through each step and extract model references
+	for _, stepValue := range workflow {
+		stepMap, ok := stepValue.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check direct model field
+		invalidModels = append(invalidModels, extractInvalidModels(stepMap["model"], validModels, seen)...)
+
+		// Check generate block
+		if generate, ok := stepMap["generate"].(map[string]interface{}); ok {
+			invalidModels = append(invalidModels, extractInvalidModels(generate["model"], validModels, seen)...)
+		}
+
+		// Check agentic_loop block (inline syntax)
+		if agenticLoop, ok := stepMap["agentic_loop"].(map[string]interface{}); ok {
+			// Check steps within the agentic loop
+			if steps, ok := agenticLoop["steps"].([]interface{}); ok {
+				for _, step := range steps {
+					if stepMap, ok := step.(map[string]interface{}); ok {
+						invalidModels = append(invalidModels, extractInvalidModels(stepMap["model"], validModels, seen)...)
+					}
+				}
+			}
+		}
+	}
+
+	// Check agentic-loop block (top-level syntax)
+	if agenticLoop, ok := workflow["agentic-loop"].(map[string]interface{}); ok {
+		if steps, ok := agenticLoop["steps"].(map[string]interface{}); ok {
+			for _, stepValue := range steps {
+				if stepMap, ok := stepValue.(map[string]interface{}); ok {
+					invalidModels = append(invalidModels, extractInvalidModels(stepMap["model"], validModels, seen)...)
+				}
+			}
+		}
+	}
+
+	return invalidModels
+}
+
+// extractInvalidModels extracts model names from a model field value and returns
+// those not in the validModels set
+func extractInvalidModels(modelField interface{}, validModels map[string]bool, seen map[string]bool) []string {
+	var invalid []string
+
+	switch v := modelField.(type) {
+	case string:
+		if v != "" && strings.ToUpper(v) != "NA" {
+			lower := strings.ToLower(v)
+			if !validModels[lower] && !seen[lower] {
+				invalid = append(invalid, v)
+				seen[lower] = true
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" && strings.ToUpper(s) != "NA" {
+				lower := strings.ToLower(s)
+				if !validModels[lower] && !seen[lower] {
+					invalid = append(invalid, s)
+					seen[lower] = true
+				}
+			}
+		}
+	}
+
+	return invalid
 }
 
 // formatModelsList formats a list of models as a comma-separated string with code formatting
@@ -53,12 +145,73 @@ const EmbeddedLLMGuide = `# Comanda YAML DSL Guide (for LLM Consumption)
 
 This guide specifies the YAML-based Domain Specific Language (DSL) for Comanda workflows, enabling LLMs to generate valid workflow files.
 
+## ⚠️ CRITICAL RULES - READ BEFORE GENERATING ⚠️
+
+**RULE 1 - execute_loops IGNORES top-level steps:**
+When a workflow has ` + "`execute_loops:`" + `, ONLY the loops in the ` + "`loops:`" + ` block run. Any steps defined outside ` + "`loops:`" + ` are COMPLETELY IGNORED.
+
+**RULE 2 - codebase-index with multi-loop workflows:**
+If you need codebase-index AND multiple loops, the codebase-index MUST be inside a loop:
+` + "```yaml" + `
+loops:
+  indexer:
+    max_iterations: 1
+    allowed_paths: [~/myproject, .]
+    steps:
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/myproject
+          output:
+            path: .comanda/INDEX.md
+            store: repo
+
+  analyzer:
+    depends_on: [indexer]
+    steps:
+      analyze:
+        input: .comanda/INDEX.md
+        model: claude-code
+        action: "Analyze the codebase"
+        output: STDOUT
+
+execute_loops:
+  - indexer
+  - analyzer
+` + "```" + `
+
+**RULE 3 - Output to files, not STDOUT, in multi-step/multi-loop workflows:**
+When a workflow has multiple steps or loops that build on each other, use file outputs (e.g., ` + "`output: ./results.md`" + `) instead of ` + "`output: STDOUT`" + `. STDOUT is only useful when the next step uses ` + "`input: STDIN`" + `. For agentic loops that create documentation or artifacts, always write to files so later loops can read them.
+
+**RULE 4 - Never put codebase-index as a top-level step with execute_loops:**
+` + "```yaml" + `
+# ❌ WRONG - index_step is IGNORED, $PROJECT_INDEX is never set!
+index_step:
+  step_type: codebase-index
+  codebase_index:
+    root: ~/myproject
+
+loops:
+  analyze:
+    steps:
+      step1:
+        input: $PROJECT_INDEX  # ❌ This variable doesn't exist!
+        ...
+
+execute_loops:
+  - analyze
+` + "```" + `
+
 ## Overview
 
-Comanda workflows consist of one or more named steps. Each step performs an operation. There are three main types of steps:
+Comanda workflows consist of one or more named steps. Each step performs an operation. There are seven main types of steps:
 1.  **Standard Processing Step:** Involves LLMs, file processing, data operations.
 2.  **Generate Step:** Uses an LLM to dynamically create a new Comanda workflow YAML file.
 3.  **Process Step:** Executes another Comanda workflow file (static or dynamically generated).
+4.  **Agentic Loop Step:** Iteratively processes until an exit condition is met (for refinement, planning, autonomous tasks).
+5.  **Multi-Loop Orchestration:** Coordinates multiple interdependent agentic loops with variable passing and creator/checker patterns.
+6.  **Codebase Index Step:** Scans a repository and generates a compact Markdown index for LLM consumption.
+7.  **qmd Search Step:** Searches local knowledge bases using qmd (BM25, vector, or hybrid search).
 
 ## Core Workflow Structure
 
@@ -147,6 +300,966 @@ step_name_for_processing:
 - ` + "`workflow_file`" + `: (string, required) The path to the Comanda workflow YAML file to be executed. This can be a statically defined path or the output of a ` + "`generate`" + ` step.
 - ` + "`inputs`" + `: (map, optional) A map of key-value pairs to pass as initial variables to the sub-workflow. These can be accessed within the sub-workflow (e.g., as ` + "`$parent.key1`" + `).
 - **Note:** The ` + "`input`" + ` field for a ` + "`process`" + ` step is optional. If ` + "`input: STDIN`" + ` is used, the output of the previous step in the parent workflow will be available as the initial ` + "`STDIN`" + ` for the *first* step of the sub-workflow if that first step expects ` + "`STDIN`" + `.
+
+## Durable Semantic Memory (memory)
+
+Use semantic memory only when a step needs durable facts from separate runs or sessions, such as previous decisions, constraints, failures, or findings. It is optional; ordinary one-shot workflows and loops that only need current-iteration context should omit it.
+
+Example:
+
+    review:
+      input: STDIN
+      model: openai-codex
+      memory:
+        namespace: project
+        recall:
+          query: input
+          limit: 6
+          max_chars: 6000
+          types: [decision, constraint, failure]
+      action: "Use relevant durable facts as evidence and cite their IDs."
+      output: STDOUT
+
+- memory: true is the legacy mode that injects the full configured COMANDA.md file. Use the mapping above for bounded semantic recall.
+- Memory is seeded explicitly with comanda memory add; model output is not automatically stored as durable memory.
+- In a block-style agentic-loop with explicit steps:, put memory: on every inner step that needs recall. Do not put it under agentic-loop.config and do not assume a parent setting is inherited.
+
+## Knowledge Graph Context (graph_node recall)
+
+A codebase index can be turned into a knowledge graph stored in the semantic memory database: typed nodes for components, packages, files, types, and functions, connected by confidence-tagged edges (EXTRACTED vs INFERRED). The graph is built outside workflows with the CLI: comanda index capture -n <name> --graph, or comanda graph build <name> on a registered index. There is no workflow step type for building graphs, and no knowledge_graph or graph: field in the DSL.
+
+Every graph node is mirrored as a graph_node memory record in the <name> namespace, so steps consume the graph through the standard memory mapping by adding graph_node to recall.types, typically alongside decision and constraint. The memory namespace must match the index name.
+
+Use graph_node recall when a step or agentic loop needs durable codebase structure context (which files, packages, types, and functions exist and how they connect) instead of re-scanning the repository each iteration. Recall is bounded by limit and max_chars, so long loops get focused context rather than the whole index.
+
+Example (agentic loop step with codebase context):
+
+    implement:
+      input: $PLAN
+      model: openai-codex
+      memory:
+        namespace: myproject
+        recall:
+          query: input
+          limit: 8
+          max_chars: 6000
+          types: [graph_node, decision, constraint]
+      action: "Implement using the recalled graph nodes as a codebase map; cite node IDs you rely on."
+      output: STDOUT
+
+- Build or refresh the graph before running the workflow (comanda graph update <name>); workflows only read it.
+- Graph recall works only through memory.recall.types; do not invent graph-specific DSL fields.
+
+## 4. Agentic Loop Step Definition (` + "`agentic_loop`" + ` / ` + "`agentic-loop`" + `)
+
+Agentic loops enable iterative LLM processing until an exit condition is met. This is powerful for tasks that require refinement, multi-step reasoning, or autonomous decision-making.
+
+**⚠️ DEFAULT TO LINEAR WORKFLOWS. Use agentic loops ONLY when true iteration is required.**
+
+**When to use agentic loops (ONLY for genuine iteration):**
+- Iterative code improvement where quality gates determine completion (analyze → fix → verify until tests pass)
+- Tasks where the number of iterations is genuinely unknown and the LLM must decide when done
+- Autonomous retry loops driven by external feedback (e.g., test failures, validator output)
+
+**When NOT to use agentic loops — use linear steps instead:**
+- Reading named input files, consulting reference documents, writing to a specified output — ALWAYS linear
+- Any "read A, consult B, process C, write output.md" pattern — LINEAR, not agentic
+- Workflows with defined inputs and a specified output format — use linear steps
+- Document analysis, report generation, financial analysis, credit underwriting, data extraction — linear workflows
+- When all steps are known in advance and each executes exactly once — use linear steps
+
+### Inline Syntax (Single-Step Loop)
+
+For simple iterative tasks with a single step:
+
+` + "```yaml" + `
+step_name:
+  agentic_loop:
+    max_iterations: 5           # Safety limit (default: 10)
+    exit_condition: pattern_match  # or "llm_decides"
+    exit_pattern: "COMPLETE"    # Regex pattern for pattern_match
+  input: STDIN
+  model: claude-code
+  action: |
+    Iteration {{ loop.iteration }}.
+    Previous work: {{ loop.previous_output }}
+
+    Continue improving. Say COMPLETE when done.
+  output: STDOUT
+` + "```" + `
+
+### Block Syntax (Multi-Step Loop)
+
+For complex loops with multiple sub-steps per iteration:
+
+` + "```yaml" + `
+agentic-loop:
+  config:
+    max_iterations: 5           # Safety limit (default: 10)
+    timeout_seconds: 300        # Total timeout (default: 300)
+    codex_timeout_seconds: 1200 # Per-Codex-command timeout (default: 20 minutes)
+    exit_condition: llm_decides # or "pattern_match"
+    exit_pattern: "DONE"        # For pattern_match
+    context_window: 3           # Past iterations to include (default: 5)
+
+  steps:
+    plan:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }}.
+        Previous: {{ loop.previous_output }}
+
+        Plan next steps. Say DONE if complete.
+      output: $PLAN
+
+    execute:
+      input: $PLAN
+      model: claude-code
+      action: "Execute the plan"
+      output: STDOUT
+` + "```" + `
+
+**` + "`agentic_loop`" + ` Configuration:**
+
+**Core Settings:**
+- ` + "`max_iterations`" + `: (int, default: 10) Maximum iterations before stopping.
+- ` + "`timeout_seconds`" + `: (int, default: 0) Total time limit in seconds. **0 = no timeout** (loop runs until max_iterations or exit condition).
+- ` + "`codex_timeout_seconds`" + `: (int, default: 1200) Per-command watchdog for ` + "`openai-codex`" + ` loop steps. Set a positive value to override it; **0 uses the 20-minute provider default**. This does not change the loop-wide ` + "`timeout_seconds`" + ` setting.
+- ` + "`exit_condition`" + `: (string) How to detect completion:
+  - ` + "`llm_decides`" + `: Exits when output ends with "DONE", "COMPLETE", or "FINISHED" (case-insensitive). Works when these words appear at the very end of the output, at the end of any line, or as the entire output.
+  - ` + "`pattern_match`" + `: Exits when output matches ` + "`exit_pattern`" + ` regex
+- ` + "`exit_pattern`" + `: (string) Regex pattern for ` + "`pattern_match`" + ` condition.
+- ` + "`context_window`" + `: (int, default: 5) Number of past iterations to include in context.
+
+**File Access (REQUIRED for Claude Code):**
+- ` + "`allowed_paths`" + `: (list, **REQUIRED for file operations**) Directories where Claude Code can use tools (Read, Write, Edit, Bash, etc.). **Without this, Claude Code runs in print-only mode and CANNOT read/write files.** When generating workflows, infer paths from: the ` + "`codebase_index.root`" + ` if present, file paths mentioned in the action, or use ` + "`[.]`" + ` (current directory) as fallback.
+- ` + "`tools`" + `: (list, optional) Restrict available tools (e.g., ` + "`[Read, Glob, Grep]`" + ` for read-only access). If omitted, all tools are available.
+
+**State Persistence (for Long-Running Loops):**
+- ` + "`name`" + `: (string, **REQUIRED for stateful loops**) Unique identifier for the loop. Enables state persistence and resume capability.
+- ` + "`stateful`" + `: (bool, default: false) Enable state persistence to ` + "`~/.comanda/loop-states/{name}.json`" + `. Allows resuming after interruption.
+- ` + "`checkpoint_interval`" + `: (int, default: 5) Save state every N iterations. Lower values = more frequent saves = safer resume.
+
+**Quality Gates (Automated Validation):**
+- ` + "`quality_gates`" + `: (list, optional) Automated checks to run after each iteration. Each gate validates loop output and can trigger retry/abort/skip actions.
+- ` + "`prompt_improvement`" + `: (map, optional) Automatically refine the next iteration's prompt from the latest result.
+
+**Quality Gate Configuration:**
+` + "```yaml" + `
+quality_gates:
+  - name: typecheck           # Gate name
+    command: "npm run typecheck"  # Shell command to execute
+    on_fail: retry            # Action: retry, abort, or skip
+    timeout: 60               # Timeout in seconds
+    retry:                    # Retry configuration (optional)
+      max_attempts: 3         # Maximum retry attempts
+      backoff_type: exponential  # linear or exponential
+      initial_delay: 5        # Initial delay in seconds
+
+  - name: security
+    type: security            # Built-in gate type (syntax, security, test)
+    on_fail: abort
+
+  - name: tests
+    command: "npm test"
+    on_fail: skip             # Continue even if this fails
+` + "```" + `
+
+**Built-in Quality Gate Types:**
+- ` + "`syntax`" + `: Checks for syntax errors (Python, JS, Go, etc.)
+- ` + "`security`" + `: Scans for hardcoded secrets, security issues
+- ` + "`test`" + `: Runs test commands with coverage reporting
+
+**Quality Gate Actions (` + "`on_fail`" + `):**
+- ` + "`retry`" + `: Retry the gate with backoff (exponential or linear)
+- ` + "`abort`" + `: Stop loop immediately and save state as "failed"
+- ` + "`skip`" + `: Log warning and continue to next iteration
+
+**Template Variables in Actions:**
+- ` + "`{{ loop.iteration }}`" + `: Current iteration number (1-based)
+- ` + "`{{ loop.previous_output }}`" + `: Output from previous iteration
+- ` + "`{{ loop.total_iterations }}`" + `: Maximum allowed iterations
+- ` + "`{{ loop.elapsed_seconds }}`" + `: Seconds since loop started
+- ` + "`{{ loop.current_prompt }}`" + `: The refined prompt that will be used for the next iteration
+
+**Example: Agentic Code Exploration**
+` + "```yaml" + `
+explore_codebase:
+  agentic_loop:
+    max_iterations: 3
+    exit_condition: llm_decides
+    allowed_paths: [./src, ./tests]
+    tools: [Read, Glob, Grep]  # Read-only access
+  input: STDIN
+  model: claude-code
+  action: |
+    Explore the codebase and answer: {{ loop.previous_output }}
+    Say DONE when you have the answer.
+  output: STDOUT
+` + "```" + `
+
+**Example: Iterative Code Implementation**
+` + "```yaml" + `
+implement:
+  agentic_loop:
+    max_iterations: 3
+    exit_condition: pattern_match
+    exit_pattern: "SATISFIED"
+    allowed_paths: [.]  # Required for file operations
+  input: STDIN
+  model: claude-code
+  action: |
+    Iteration {{ loop.iteration }}. Implement and improve the code.
+    Previous: {{ loop.previous_output }}
+
+    Add error handling, edge cases, tests.
+    Say SATISFIED when production-ready.
+  output: STDOUT
+` + "```" + `
+
+**Example: Plan and Build Loop**
+` + "```yaml" + `
+agentic-loop:
+  config:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]  # Required for file operations
+
+  steps:
+    plan:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }}.
+        Create/refine the implementation plan.
+        Say DONE when ready to implement.
+      output: $PLAN
+
+    build:
+      input: $PLAN
+      model: claude-code
+      action: "Generate code based on the plan"
+      output: STDOUT
+` + "```" + `
+
+**Example: Long-Running Loop with State Persistence**
+` + "```yaml" + `
+agentic-loop:
+  config:
+    name: code-refactor-loop      # Required for stateful loops
+    stateful: true                 # Enable state persistence
+    max_iterations: 50
+    timeout_seconds: 0             # No timeout - run until complete
+    checkpoint_interval: 5         # Save every 5 iterations
+    exit_condition: llm_decides
+    allowed_paths: [./src]
+
+    quality_gates:
+    name: syntax-check
+        type: syntax
+        on_fail: retry
+        retry:
+          max_attempts: 3
+          backoff_type: exponential
+          initial_delay: 2
+
+    name: tests
+        command: "npm test"
+        on_fail: abort              # Stop if tests fail
+        timeout: 300
+
+  steps:
+    analyze:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }} of {{ loop.total_iterations }}.
+        Analyze code and refactor one module.
+        Say DONE when all modules are refactored.
+      output: STDOUT
+` + "```" + `
+
+**Example: Quality Gates with Retry**
+` + "```yaml" + `
+code_improvement:
+  agentic_loop:
+    name: improve-code
+    stateful: true
+    max_iterations: 10
+    allowed_paths: [.]
+
+    quality_gates:
+    name: typecheck
+        command: "npm run typecheck"
+        on_fail: retry
+        timeout: 60
+        retry:
+          max_attempts: 3
+          backoff_type: exponential
+          initial_delay: 5
+
+    name: lint
+        command: "npm run lint"
+        on_fail: skip               # Non-critical, continue
+
+  input: STDIN
+  model: claude-code
+  action: "Improve code quality. Say COMPLETE when done."
+  output: STDOUT
+` + "```" + `
+
+**CRITICAL: When generating agentic_loop workflows with Claude Code:**
+- **ALWAYS include ` + "`allowed_paths`" + `** - Claude Code CANNOT read/write files without it
+- If the workflow uses ` + "`codebase_index`" + `, use the same ` + "`root`" + ` directory in ` + "`allowed_paths`" + `
+- If the action mentions specific file paths or directories, include those directories
+- When in doubt, use ` + "`allowed_paths: [.]`" + ` for current directory access
+- Forgetting ` + "`allowed_paths`" + ` is a common error that causes "permission denied" failures
+- For long-running tasks (hours/days), use ` + "`stateful: true`" + ` and ` + "`timeout_seconds: 0`" + `
+- **Default to ` + "`claude-code`" + ` model for agentic workflows** - it provides the best tool use and autonomous capabilities
+
+## 5. Multi-Loop Orchestration
+
+Multi-loop orchestration enables complex autonomous workflows with multiple interdependent agentic loops. This is essential for creator/checker patterns, sequential processing pipelines, and complex task decomposition.
+
+**When to use multi-loop orchestration:**
+- Creator/checker validation workflows (loop A creates, loop B validates, rerun A if validation fails)
+- Sequential data processing (collect → analyze → report)
+- Complex task decomposition (break large task into specialized sub-loops)
+- Workflows requiring variable passing between autonomous agents
+
+### Named Loops Syntax
+
+Define multiple named loops with dependencies and variable passing:
+
+` + "```yaml" + `
+loops:
+  data-collector:
+    name: data-collector
+    stateful: true
+    max_iterations: 10
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $RAW_DATA         # Export result to variable
+
+    steps:
+    collect:
+          input: STDIN
+          model: claude-code
+          action: "Collect data and say DONE when complete"
+          output: STDOUT
+
+  data-analyzer:
+    name: data-analyzer
+    depends_on: [data-collector]    # Wait for collector to complete
+    input_state: $RAW_DATA           # Read collector's output
+    stateful: true
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $ANALYSIS          # Export analysis result
+
+    steps:
+    analyze:
+          input: STDIN
+          model: claude-code
+          action: |
+            Analyze this data: {{ loop.previous_output }}
+            Say DONE when analysis is complete.
+          output: STDOUT
+
+  report-generator:
+    name: report-generator
+    depends_on: [data-analyzer]     # Wait for analyzer
+    input_state: $ANALYSIS           # Read analyzer's output
+    max_iterations: 1
+    allowed_paths: [.]
+
+    steps:
+    generate:
+          input: STDIN
+          model: claude-code
+          action: "Create final report based on analysis"
+          output: STDOUT
+
+# Execute loops in dependency order (topological sort)
+execute_loops:
+  - data-collector
+  - data-analyzer
+  - report-generator
+` + "```" + `
+
+**Key Configuration Fields:**
+- ` + "`loops`" + `: (map) Named loop definitions
+- ` + "`depends_on`" + `: (list) Loops that must complete before this one starts
+- ` + "`input_state`" + `: (string) Variable to read as input (e.g., ` + "`$RAW_DATA`" + `)
+- ` + "`output_state`" + `: (string) Variable to export result to (e.g., ` + "`$ANALYSIS`" + `)
+- ` + "`execute_loops`" + `: (list) Simple execution order (dependencies override this)
+
+### Creator/Checker Pattern
+
+Advanced workflow pattern where a creator loop implements features and a checker loop validates them, with automatic rerun on failure:
+
+` + "```yaml" + `
+loops:
+  # Creator loop: implements features
+  feature-creator:
+    name: feature-creator
+    stateful: true
+    max_iterations: 3
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $CODE
+
+    quality_gates:
+    name: syntax
+        type: syntax
+        on_fail: abort
+
+    steps:
+    implement:
+          input: STDIN
+          model: claude-code
+          action: |
+            Iteration {{ loop.iteration }}.
+            Implement the requested feature.
+            Say DONE when implementation is complete.
+          output: STDOUT
+
+  # Checker loop: validates implementation
+  code-checker:
+    name: code-checker
+    depends_on: [feature-creator]   # Wait for creator
+    input_state: $CODE               # Read creator's output
+    max_iterations: 1
+    exit_condition: pattern_match
+    exit_pattern: "^PASS"            # Exit when output starts with PASS
+
+    steps:
+    review:
+          input: STDIN
+          model: claude-code
+          action: |
+            Review this implementation: {{ loop.previous_output }}
+
+            Check for:
+            - Correctness
+            - Edge cases
+            - Code quality
+            - Test coverage
+
+            Output: PASS if acceptable, or FAIL with specific issues.
+          output: STDOUT
+
+# Advanced workflow with creator/checker relationship
+workflow:
+  creator:
+    type: loop
+    loop: feature-creator
+    role: creator
+
+  checker:
+    type: loop
+    loop: code-checker
+    role: checker
+    validates: creator               # This loop validates the creator
+    on_fail: rerun_creator          # Auto-rerun creator if validation fails
+` + "```" + `
+
+**Workflow Node Configuration:**
+- ` + "`type`" + `: Always ` + "`loop`" + ` for loop nodes
+- ` + "`loop`" + `: Name of the loop to execute
+- ` + "`role`" + `: Node role (` + "`creator`" + `, ` + "`checker`" + `, ` + "`finalizer`" + `)
+- ` + "`validates`" + `: Name of the node this checker validates
+- ` + "`on_fail`" + `: Action on validation failure:
+  - ` + "`rerun_creator`" + `: Automatically rerun the creator loop (max 3 attempts)
+  - ` + "`abort`" + `: Stop workflow immediately
+  - ` + "`manual`" + `: Return for manual review
+
+**Validation Logic:**
+- Checker loop output is scanned for "PASS" or "FAIL"
+- If "PASS" found → workflow continues
+- If "FAIL" found and ` + "`on_fail: rerun_creator`" + ` → creator reruns with checker feedback
+- Maximum 3 rerun attempts (prevents infinite loops)
+
+### Dependency Graph Execution
+
+Comanda automatically executes loops in correct order using topological sort:
+
+1. **Build dependency graph** from ` + "`depends_on`" + ` relationships
+2. **Detect cycles** - fail fast if circular dependencies exist
+3. **Topological sort** using Kahn's algorithm
+4. **Execute in order** - each loop waits for its dependencies
+
+**Cycle Detection Example:**
+` + "```yaml" + `
+loops:
+  loop-a:
+    depends_on: [loop-b]
+
+  loop-b:
+    depends_on: [loop-a]
+
+execute_loops:
+  - loop-a
+  - loop-b
+
+# Error: dependency cycle detected: loop-a -> loop-b -> loop-a
+` + "```" + `
+
+### Variable Passing
+
+Variables flow between loops via ` + "`input_state`" + ` and ` + "`output_state`" + `:
+
+` + "```yaml" + `
+loops:
+  producer:
+    output_state: $MY_DATA          # Write to variable
+
+  consumer:
+    depends_on: [producer]
+    input_state: $MY_DATA            # Read from variable
+` + "```" + `
+
+**Variable Rules:**
+- Variables are stored in memory during workflow execution
+- ` + "`output_state`" + ` exports loop's final output to a variable
+- ` + "`input_state`" + ` reads variable as loop input
+- Variables persist across loop boundaries
+- Missing variable causes error (check dependencies)
+
+### Complete Example: Codebase Analysis Pipeline
+
+` + "```yaml" + `
+# Multi-loop workflow: analyze codebase → identify issues → generate report
+loops:
+  codebase-analyzer:
+    name: codebase-analyzer
+    stateful: true
+    max_iterations: 20
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [/tmp/code]
+    output_state: $ANALYSIS
+
+    steps:
+    analyze:
+          input: NA
+          model: claude-code
+          action: |
+            Analyze the codebase at /tmp/code.
+            Find patterns, architecture issues, dependencies.
+            Say DONE when analysis is complete.
+          output: STDOUT
+
+  tech-debt-finder:
+    name: tech-debt-finder
+    depends_on: [codebase-analyzer]
+    input_state: $ANALYSIS
+    stateful: true
+    max_iterations: 10
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [/tmp/code]
+    output_state: $TECH_DEBT
+
+    steps:
+    identify:
+          input: STDIN
+          model: claude-code
+          action: |
+            Based on this analysis: {{ loop.previous_output }}
+
+            Identify tech debt and anti-patterns:
+            - Code smells
+            - Security issues
+            - Performance bottlenecks
+            - Maintainability problems
+
+            Say DONE when complete.
+          output: STDOUT
+
+  report-writer:
+    name: report-writer
+    depends_on: [tech-debt-finder]
+    input_state: $TECH_DEBT
+    max_iterations: 1
+    allowed_paths: [.]
+
+    steps:
+    write:
+          input: STDIN
+          model: claude-code
+          action: |
+            Create a comprehensive markdown report:
+            {{ loop.previous_output }}
+
+            Save to ./tech-debt-report.md
+          output: STDOUT
+
+execute_loops:
+  - codebase-analyzer
+  - tech-debt-finder
+  - report-writer
+` + "```" + `
+
+**CRITICAL: When generating multi-loop workflows:**
+- **Use ` + "`claude-code`" + ` as default model** for agentic capabilities
+- **Always include ` + "`allowed_paths`" + `** for each loop that needs file access
+- **Use ` + "`stateful: true`" + `** for long-running loops
+- **Set ` + "`timeout_seconds: 0`" + `** for unlimited runtime
+- **Use meaningful variable names** (` + "`$RAW_DATA`" + `, not ` + "`$OUTPUT`" + `)
+- **Infer ` + "`allowed_paths`" + ` from user prompt** (e.g., "/tmp/code" → ` + "`allowed_paths: [/tmp/code]`" + `)
+- **Default ` + "`checkpoint_interval: 5`" + `** for safety
+
+### Using Codebase Index with Multi-Loop Workflows
+
+**⚠️ CRITICAL:** When using ` + "`execute_loops:`" + `, **ONLY the loops are executed**. Top-level steps (outside the ` + "`loops:`" + ` block) are IGNORED.
+
+❌ **WRONG** - Top-level codebase-index step will NOT run:
+` + "```yaml" + `
+# This step is IGNORED when using execute_loops!
+index_core:
+  step_type: codebase-index
+  codebase_index:
+    root: ~/my-project
+
+loops:
+  analyze:
+    steps:
+      step1:
+        input: $MY_PROJECT_INDEX  # ❌ Variable never set!
+        model: claude-code
+        action: "Analyze the codebase"
+        output: STDOUT
+
+execute_loops:
+  - analyze
+` + "```" + `
+
+✅ **CORRECT** - Reference the output file path directly:
+` + "```yaml" + `
+loops:
+  analyze:
+    allowed_paths: [~/my-project, .]
+    steps:
+      # First step: Generate the index
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/my-project
+          output:
+            path: .comanda/MY_PROJECT_INDEX.md
+            store: repo
+
+      # Subsequent steps: Read the index file directly
+      analyze:
+        input: .comanda/MY_PROJECT_INDEX.md
+        model: claude-code
+        action: "Analyze this codebase index"
+        output: STDOUT
+
+execute_loops:
+  - analyze
+` + "```" + `
+
+✅ **ALSO CORRECT** - Use input_state to pass index between loops:
+` + "```yaml" + `
+loops:
+  indexer:
+    max_iterations: 1
+    allowed_paths: [~/my-project]
+    output_state: $CODEBASE_INDEX
+    steps:
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/my-project
+        output: STDOUT
+
+  analyzer:
+    depends_on: [indexer]
+    input_state: $CODEBASE_INDEX
+    allowed_paths: [~/my-project, .]
+    steps:
+      analyze:
+        input: STDIN
+        model: claude-code
+        action: |
+          Codebase index:
+          {{ loop.previous_output }}
+
+          Analyze the architecture.
+        output: STDOUT
+
+execute_loops:
+  - indexer
+  - analyzer
+` + "```" + `
+
+
+## 6. Codebase Index Step Definition (` + "`codebase_index`" + `)
+
+This step scans a repository and generates a compact Markdown index optimized for LLM consumption. It supports multiple programming languages and exposes workflow variables for downstream steps.
+
+**When to use codebase-index:**
+- When you need to give an LLM context about a codebase structure
+- Before code analysis, refactoring, or documentation tasks
+- When building workflows that operate on unfamiliar repositories
+
+**Structure:**
+` + "```yaml" + `
+step_name:
+  step_type: codebase-index  # Alternative: use codebase_index block
+  codebase_index:
+    root: .                   # Repository path (default: current directory)
+    output:
+      path: .comanda/INDEX.md # Custom output path (optional)
+      format: structured      # Output format: summary, structured, full
+      store: repo             # Where to store: repo, config, or both
+      encrypt: false          # Enable AES-256 encryption
+    expose:
+      workflow_variable: true # Export as workflow variables
+      memory:
+        enabled: true         # Register as memory source
+        key: repo.index       # Memory key name
+    adapters:                 # Per-language configuration (optional)
+      go:
+        ignore_dirs: [vendor, testdata]
+        priority_files: ["cmd/**/*.go"]
+    max_output_kb: 100        # Maximum output size in KB
+    max_files: 10000           # Source files to index (0 = unlimited)
+    enhance: false            # Optional second-pass AI macro analysis
+    enhance_model: claude-code # Optional; defaults to default_generation_model
+    qmd:                      # qmd integration (optional)
+      collection: myproject   # Register index as qmd collection
+      context: "Project source code"  # Description for search relevance
+      embed: false            # Run qmd embed after (slow, enables semantic search)
+` + "```" + `
+
+**` + "`codebase_index`" + ` Block Attributes:**
+- ` + "`root`" + `: (string, default: ` + "`.`" + `) Repository path to scan.
+- ` + "`output.path`" + `: (string, optional) Custom output file path. Default: ` + "`.comanda/<repo>_INDEX.md`" + `
+- ` + "`output.format`" + `: (string, default: ` + "`structured`" + `) Output format: ` + "`summary`" + ` (compact 1-2KB for system prompts), ` + "`structured`" + ` (balanced with sections), or ` + "`full`" + ` (detailed with all symbols).
+- ` + "`output.store`" + `: (string, default: ` + "`repo`" + `) Where to save: ` + "`repo`" + ` (in repository), ` + "`config`" + ` (~/.comanda/), or ` + "`both`" + `.
+- ` + "`output.encrypt`" + `: (bool, default: false) Encrypt output with AES-256 GCM. Saves as ` + "`.enc`" + ` file. Requires ` + "`COMANDA_INDEX_KEY`" + ` environment variable.
+- ` + "`expose.workflow_variable`" + `: (bool, default: true) Export index as workflow variables.
+- ` + "`expose.memory.enabled`" + `: (bool, default: false) Register as a named memory source.
+- ` + "`expose.memory.key`" + `: (string) Key name for memory access.
+- ` + "`adapters`" + `: (map, optional) Per-language configuration overrides.
+- ` + "`max_output_kb`" + `: (int, default: 100) Maximum size of generated index.
+- ` + "`max_files`" + `: (int, default: 10000) Maximum source files selected for indexing; ` + "`0`" + ` means unlimited.
+- ` + "`enhance`" + `: (bool, default: false) Run a second AI pass with the default generation model to add macro architecture analysis, component boundaries, frontend/backend patterns, and an agent change playbook.
+- ` + "`enhance_model`" + `: (string, optional) Model for ` + "`enhance`" + `; defaults to configured ` + "`default_generation_model`" + `.
+- Knowledge graph: after capturing an index, comanda index capture --graph or comanda graph build <name> turns it into a queryable knowledge graph stored in semantic memory; steps consume it via memory recall with types: [graph_node]. See the Knowledge Graph Context section.
+- ` + "`qmd.collection`" + `: (string, optional) Register index as a qmd collection with this name.
+- ` + "`qmd.context`" + `: (string, optional) Description for the collection (improves search relevance).
+- ` + "`qmd.embed`" + `: (bool, default: false) Run ` + "`qmd embed`" + ` after indexing (enables semantic search, slow).
+
+**Workflow Variables Exported:**
+
+After the step runs, these variables are available (where ` + "`<REPO>`" + ` is the uppercase repository name, e.g., ` + "`src`" + ` becomes ` + "`SRC`" + `):
+- ` + "`$<REPO>_INDEX`" + `: Full Markdown content of the index
+- ` + "`$<REPO>_INDEX_PATH`" + `: Absolute path to the saved index file
+- ` + "`$<REPO>_INDEX_SHA`" + `: Hash of the index content
+- ` + "`$<REPO>_INDEX_UPDATED`" + `: ` + "`true`" + ` if index was regenerated
+
+**⚠️ CRITICAL: Referencing the Index in Subsequent Steps**
+
+When a later step needs the codebase index content, you MUST use the exported variable — NOT the file path.
+
+✅ **CORRECT** - Use the exported variable:
+` + "```yaml" + `
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./src
+
+analyze_codebase:
+  input: $SRC_INDEX          # ✅ Use the variable!
+  model: claude-code
+  action: "Analyze this codebase structure"
+  output: STDOUT
+` + "```" + `
+
+❌ **WRONG** - Do NOT use the file path directly:
+` + "```yaml" + `
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./src
+    output:
+      path: .comanda/INDEX.md
+
+analyze_codebase:
+  input: .comanda/INDEX.md    # ❌ WRONG! Path may not resolve correctly
+  model: claude-code
+  action: "Analyze this codebase structure"
+  output: STDOUT
+` + "```" + `
+
+**Why?** The ` + "`output.path`" + ` is relative to the repository root (when ` + "`store: repo`" + `), not the current working directory. The exported variable always contains the correct content regardless of where you run the workflow.
+
+**Supported Languages:**
+- **Go**: Uses AST parsing. Detection: ` + "`go.mod`" + `, ` + "`go.sum`" + `
+- **Python**: Uses regex. Detection: ` + "`pyproject.toml`" + `, ` + "`requirements.txt`" + `, ` + "`setup.py`" + `
+- **TypeScript/JavaScript**: Uses regex. Detection: ` + "`tsconfig.json`" + `, ` + "`package.json`" + `
+- **Flutter/Dart**: Uses regex. Detection: ` + "`pubspec.yaml`" + `
+- **Java**: Uses regex. Detection: ` + "`pom.xml`" + `, ` + "`build.gradle`" + `, ` + "`build.gradle.kts`" + `
+
+**Example: Index and Analyze a Codebase**
+` + "```yaml" + `
+# Step 1: Generate codebase index
+index_repo:
+  step_type: codebase-index
+  codebase_index:
+    root: ./my-project
+    expose:
+      workflow_variable: true
+
+# Step 2: Use the index for analysis
+analyze_architecture:
+  input: STDIN
+  model: claude-code
+  action: |
+    Here is the codebase index:
+    $MY_PROJECT_INDEX
+
+    Analyze the architecture and suggest improvements.
+  output: STDOUT
+` + "```" + `
+
+**Example: Minimal Usage**
+` + "```yaml" + `
+index_repo:
+  step_type: codebase-index
+  codebase_index:
+    root: .
+` + "```" + `
+
+### Using the Index Registry
+
+Indexes can be pre-captured using ` + "`comanda index capture`" + `, then loaded without regenerating:
+
+**Loading from Registry:**
+` + "```yaml" + `
+load_index:
+  codebase_index:
+    use: myproject              # Load from registry
+    max_age: 24h                # Warn if stale
+
+load_multiple:
+  codebase_index:
+    use: [project1, project2]   # Load multiple indexes
+    aggregate: true             # Create $AGGREGATED_INDEX
+` + "```" + `
+
+**Inline Index References (` + "`${INDEX:name}`" + `):**
+` + "```yaml" + `
+analyze:
+  input: |
+    Context: ${INDEX:myproject}
+    Review the architecture.
+  model: claude
+  output: STDOUT
+` + "```" + `
+
+
+## 7. qmd Search Step Definition (` + "`qmd_search`" + `)
+
+This step searches local knowledge bases using qmd, providing BM25, vector, or hybrid search capabilities.
+
+**When to use qmd-search:**
+- Retrieval-Augmented Generation (RAG) workflows
+- Searching indexed codebases or documentation
+- Finding relevant context before LLM processing
+
+**Prerequisites:**
+- Install qmd: ` + "`bun install -g @tobilu/qmd`" + `
+- Create a collection: ` + "`qmd collection add ./docs --name docs`" + `
+
+**Structure:**
+` + "```yaml" + `
+step_name:
+  type: qmd-search
+  qmd_search:
+    query: "${QUESTION}"      # Search query (supports variable substitution)
+    collection: docs          # Optional: restrict to specific collection
+    mode: search              # search (BM25), vsearch (vector), query (hybrid)
+    limit: 5                  # Number of results (default: 5)
+    min_score: 0.3            # Minimum relevance score (0.0-1.0)
+    format: text              # Output format: text (default), json, files
+  output: CONTEXT             # Store results in variable
+` + "```" + `
+
+**` + "`qmd_search`" + ` Block Attributes:**
+- ` + "`query`" + `: (string, required) Search query. Supports variable substitution (e.g., ` + "`${QUESTION}`" + `).
+- ` + "`collection`" + `: (string, optional) Restrict search to a specific qmd collection.
+- ` + "`mode`" + `: (string, default: ` + "`search`" + `) Search mode:
+  - ` + "`search`" + `: BM25 keyword search (fastest, recommended default)
+  - ` + "`vsearch`" + `: Vector/semantic search (slower, requires embeddings)
+  - ` + "`query`" + `: Hybrid search with LLM reranking (slowest, best quality)
+- ` + "`limit`" + `: (int, default: 5) Maximum number of results to return.
+- ` + "`min_score`" + `: (float, optional) Minimum relevance score threshold (0.0-1.0).
+- ` + "`format`" + `: (string, default: ` + "`text`" + `) Output format:
+  - ` + "`text`" + `: Human-readable text output
+  - ` + "`json`" + `: Structured JSON output
+  - ` + "`files`" + `: List of matching file paths only
+- ` + "`full`" + `: (bool, default: false) Return full document content instead of snippets.
+
+**Example: RAG Workflow**
+` + "```yaml" + `
+# Search for relevant context
+retrieve_context:
+  type: qmd-search
+  qmd_search:
+    query: "${USER_QUESTION}"
+    collection: docs
+    mode: search
+    limit: 5
+  output: CONTEXT
+
+# Generate answer with context
+generate_answer:
+  input: |
+    Context:
+    ${CONTEXT}
+    
+    Question: ${USER_QUESTION}
+  model: claude-sonnet
+  action: "Answer the question using only the provided context."
+  output: STDOUT
+` + "```" + `
+
+**Example: Code Search with codebase-index**
+` + "```yaml" + `
+# Index codebase with qmd registration
+index_code:
+  type: codebase-index
+  codebase_index:
+    root: ./src
+    qmd:
+      collection: mycode
+      context: "Application source code"
+
+# Search the indexed code
+find_relevant_code:
+  type: qmd-search
+  qmd_search:
+    query: "authentication middleware"
+    collection: mycode
+    limit: 10
+  output: RELEVANT_CODE
+
+# Analyze with LLM
+analyze_code:
+  input: ${RELEVANT_CODE}
+  model: claude-code
+  action: "Analyze these code snippets and suggest improvements."
+  output: STDOUT
+` + "```" + `
 
 ## Common Elements (for Standard Steps)
 
@@ -224,9 +1337,30 @@ consolidate_results:
 
 ### Outputs
 - Console: ` + "`output: STDOUT`" + `
-- File: ` + "`output: results.txt`" + `
+- File: ` + "`output: results.txt`" + ` or ` + "`output: ./path/to/output.md`" + `
 - Database: ` + "`output: { database: { type: \"postgres\", table: \"results_table\" } }`" + `
 - Output with alias (if supported for variable creation from output): ` + "`output: STDOUT as $step_output_var`" + `
+
+**⚠️ IMPORTANT: Writing to files**
+When the result should be saved to a file, use the ` + "`output:`" + ` field directly. Do NOT instruct the LLM to "write to a file" in the action.
+
+✅ **CORRECT** - Use ` + "`output:`" + ` for file writing:
+` + "```yaml" + `
+summarize_document:
+  input: report.txt
+  model: claude-code
+  action: "Summarize this document"
+  output: ./summary.md
+` + "```" + `
+
+❌ **WRONG** - Do NOT tell the LLM to write the file:
+` + "```yaml" + `
+summarize_document:
+  input: report.txt
+  model: claude-code
+  action: "Summarize this document and write it to ./summary.md"
+  output: STDOUT
+` + "```" + `
 
 ## Variables
 - Definition: ` + "`input: data.txt as $initial_data`" + `
@@ -250,7 +1384,27 @@ consolidate_results:
     *   ` + "`process`" + ` block must contain ` + "`workflow_file`" + ` (string path).
     *   ` + "`process.inputs`" + ` is optional.
     *   Top-level ` + "`input`" + ` for the step is optional (can be ` + "`NA`" + ` or ` + "`STDIN`" + ` to pipe to sub-workflow).
+5.  **Agentic Loop Step (Inline):**
+    *   Must contain an ` + "`agentic_loop`" + ` block with loop configuration.
+    *   Must also contain ` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + ` at the step level.
+    *   ` + "`agentic_loop.max_iterations`" + ` defaults to 10 if not specified.
+    *   ` + "`agentic_loop.exit_condition`" + ` can be ` + "`llm_decides`" + ` or ` + "`pattern_match`" + `.
+6.  **Agentic Loop Block (Top-level):**
+    *   Uses ` + "`agentic-loop:`" + ` as a top-level key (like ` + "`parallel-process:`" + `).
+    *   Must contain ` + "`config`" + ` block with loop settings.
+    *   Must contain ` + "`steps`" + ` block with one or more sub-steps.
+    *   Each sub-step follows standard step structure (` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + `).
+7.  **Codebase Index Step:**
+    *   Must have ` + "`step_type: codebase-index`" + ` OR contain a ` + "`codebase_index`" + ` block.
+    *   ` + "`codebase_index.root`" + ` defaults to ` + "`.`" + ` (current directory).
+    *   Exports workflow variables: ` + "`<REPO>_INDEX`" + `, ` + "`<REPO>_INDEX_PATH`" + `, ` + "`<REPO>_INDEX_SHA`" + `, ` + "`<REPO>_INDEX_UPDATED`" + `.
+    *   Does not require ` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, or ` + "`output`" + ` fields.
 
+8.  **qmd Search Step:**
+    *   Must have ` + "`type: qmd-search`" + ` OR contain a ` + "`qmd_search`" + ` block.
+    *   ` + "`qmd_search.query`" + ` is required.
+    *   ` + "`qmd_search.mode`" + ` defaults to ` + "`search`" + ` (BM25).
+    *   Does not require ` + "`input`" + `, ` + "`model`" + `, or ` + "`action`" + ` fields.
 ## Chaining and Examples
 
 Steps can be "chained together" by either passing STDOUT from one step to STDIN of the next step or by writing to a file and then having subsequent steps take this file as input.
@@ -317,6 +1471,69 @@ final_summary:
 
 This file-based approach is the correct way to handle any workflow where a step's logic depends on having discrete access to multiple prior outputs.
 
+## CRITICAL: Workflow Simplicity Guidelines
+
+**ALWAYS prefer the simplest possible workflow.** Over-engineered workflows are harder to debug, maintain, and understand.
+
+**Key principles:**
+1. **Minimize steps**: If a task can be done in 1 step, don't use 3. Most tasks need 1-2 steps.
+2. **Avoid unnecessary chaining**: Don't chain steps unless the output of one is genuinely needed by the next.
+3. **Use direct file I/O**: If you need to read a file and process it, that's ONE step, not three.
+4. **Prefer STDIN/STDOUT**: Use simple STDIN/STDOUT chaining over complex file intermediates when sequential processing suffices.
+5. **One model per workflow when possible**: Don't use multiple models unless comparing outputs or the task genuinely requires different capabilities.
+
+**Examples of OVER-ENGINEERED workflows (AVOID):**
+` + "```yaml" + `
+# BAD: Too many steps for a simple task
+read_file:
+  input: document.txt
+  model: NA
+  action: NA
+  output: temp_content.txt
+
+analyze_content:
+  input: temp_content.txt
+  model: gpt-4o-mini
+  action: "Analyze this"
+  output: temp_analysis.txt
+
+format_output:
+  input: temp_analysis.txt
+  model: gpt-4o-mini
+  action: "Format nicely"
+  output: STDOUT
+` + "```" + `
+
+**GOOD: Simple and direct:**
+` + "```yaml" + `
+# GOOD: One step does the job
+analyze_document:
+  input: document.txt
+  model: gpt-4o-mini
+  action: "Analyze this document and format the output nicely"
+  output: STDOUT
+` + "```" + `
+
+**When multiple steps ARE appropriate:**
+- Processing different source files independently, then combining results
+- Using tool commands to pre-process data before LLM analysis
+- Generating a workflow dynamically, then executing it
+- Tasks that genuinely require different models for different capabilities
+
+**⚠️ DEFAULT TO LINEAR WORKFLOWS. Agentic loops are the rare exception.**
+
+**When to use Agentic Loops (ONLY for genuine iteration):**
+- Code improvement cycles where quality gates determine completion (analyze → fix → verify until tests pass)
+- Tasks where the number of iterations is genuinely unknown and the LLM must decide when done
+- Autonomous retry loops driven by external feedback (e.g., test failures, validator output)
+
+**When NOT to use Agentic Loops — use linear steps instead:**
+- Reading named input files, consulting reference documents, writing to a specified output — this is ALWAYS linear
+- Any "read A, consult B, process C, write output.md" pattern — LINEAR, not agentic
+- Workflows with defined inputs and a specified output format — use linear steps, not loops
+- Document analysis, report generation, financial analysis, data extraction — linear workflows
+- When all steps are known in advance and each executes exactly once — use linear steps
+
 This guide covers the core concepts and syntax of Comanda's YAML DSL, including meta-processing capabilities. LLMs should use this structure to generate valid workflow files.`
 
 // embeddedLLMGuideTemplate is the template for the Comanda YAML DSL Guide
@@ -325,24 +1542,113 @@ const embeddedLLMGuideTemplate = `# Comanda YAML DSL Guide (for LLM Consumption)
 
 This guide specifies the YAML-based Domain Specific Language (DSL) for Comanda workflows, enabling LLMs to generate valid workflow files.
 
+## ⚠️ CRITICAL RULES - READ FIRST ⚠️
+
+Before generating any workflow, you MUST follow these rules:
+
+1. **MODEL RESTRICTION**: You may ONLY use models from the "Supported Models" list in this guide. DO NOT invent model names.
+2. **STEP NAMING**: Every step name must be descriptive (e.g., ` + "`extract_customer_emails`" + `, NOT ` + "`step_1`" + `).
+3. **SIMPLICITY**: Use the minimum number of steps needed. Most tasks need 1-2 steps.
+4. **execute_loops IGNORES top-level steps**: When using ` + "`execute_loops:`" + `, ONLY loops run. Steps outside ` + "`loops:`" + ` are IGNORED.
+5. **Output to files in multi-loop workflows**: Use ` + "`output: ./file.md`" + ` not ` + "`output: STDOUT`" + ` when loops build artifacts. STDOUT only works if next step uses STDIN.
+6. **codebase-index + loops**: If you need codebase-index with multiple loops, put codebase-index INSIDE a loop:
+` + "```yaml" + `
+loops:
+  indexer:
+    max_iterations: 1
+    steps:
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/myproject
+          output:
+            path: .comanda/INDEX.md
+  analyzer:
+    depends_on: [indexer]
+    steps:
+      analyze:
+        input: .comanda/INDEX.md
+        model: claude-code
+        action: "Analyze"
+        output: STDOUT
+execute_loops:
+  - indexer
+  - analyzer
+` + "```" + `
+
 ## Overview
 
-Comanda workflows consist of one or more named steps. Each step performs an operation. There are three main types of steps:
+Comanda workflows consist of one or more named steps. Each step performs an operation. There are seven main types of steps:
 1.  **Standard Processing Step:** Involves LLMs, file processing, data operations.
 2.  **Generate Step:** Uses an LLM to dynamically create a new Comanda workflow YAML file.
 3.  **Process Step:** Executes another Comanda workflow file (static or dynamically generated).
+4.  **Agentic Loop Step:** Iteratively processes until an exit condition is met (for refinement, planning, autonomous tasks).
+5.  **Multi-Loop Orchestration:** Coordinates multiple interdependent agentic loops with variable passing and creator/checker patterns.
+6.  **Codebase Index Step:** Scans a repository and generates a compact Markdown index for LLM consumption.
+7.  **qmd Search Step:** Searches local knowledge bases using qmd (BM25, vector, or hybrid search).
 
 ## Core Workflow Structure
 
 A Comanda workflow is a YAML map where each key is a ` + "`step_name`" + ` (string, user-defined), mapping to a dictionary defining the step.
 
 ` + "```yaml" + `
-# Example of a workflow structure
-workflow_step_1:
+# Example of a workflow structure (note: descriptive step names!)
+extract_customer_emails:
   # ... step definition ...
-another_step_name:
+summarize_quarterly_report:
   # ... step definition ...
 ` + "```" + `
+
+### Step Naming Requirements
+
+**Step names MUST be descriptive and meaningful.** They should clearly describe what the step does.
+
+**✅ GOOD step names** (use these patterns):
+- ` + "`extract_customer_emails`" + ` - describes the extraction action and target
+- ` + "`summarize_quarterly_report`" + ` - describes action and document type
+- ` + "`validate_json_schema`" + ` - describes the validation being performed
+- ` + "`translate_to_spanish`" + ` - describes transformation and target language
+- ` + "`analyze_sentiment_scores`" + ` - describes analysis type
+- ` + "`generate_markdown_index`" + ` - describes output format
+
+**❌ BAD step names** (DO NOT use these):
+- ` + "`step_1`" + `, ` + "`step_2`" + `, ` + "`step_3`" + ` - meaningless numbers
+- ` + "`analyze`" + `, ` + "`process`" + `, ` + "`transform`" + ` - too generic
+- ` + "`do_thing`" + `, ` + "`run_llm`" + `, ` + "`handle_data`" + ` - vague and unhelpful
+- ` + "`first`" + `, ` + "`second`" + `, ` + "`final`" + ` - positional, not descriptive
+
+**Naming pattern:** ` + "`<verb>_<object>_<qualifier>`" + ` where:
+- **verb**: extract, summarize, validate, translate, analyze, generate, filter, merge, compare
+- **object**: what is being acted on (emails, report, schema, data, logs)
+- **qualifier**: optional specifics (quarterly, customer, json, spanish)
+
+### Common YAML Mistakes (AVOID THESE)
+
+**❌ WRONG - Using hyphens for step fields:**
+` + "```yaml" + `
+step_name:
+  - input: file.txt     # WRONG! Hyphens make this a list
+  - model: gpt-4o-mini  # WRONG!
+  - action: "Do thing"  # WRONG!
+  - output: STDOUT      # WRONG!
+` + "```" + `
+
+**✅ CORRECT - Simple key-value pairs (no hyphens):**
+` + "```yaml" + `
+step_name:
+  input: file.txt
+  model: gpt-4o-mini
+  action: "Do thing"
+  output: STDOUT
+` + "```" + `
+
+**Rule:** Hyphens (` + "`-`" + `) are ONLY for list items (e.g., multiple input files: ` + "`input: [file1.txt, file2.txt]`" + `).
+Step fields like ` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + ` are key-value pairs, NOT list items.
+
+**Other common mistakes:**
+- Missing required fields (` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + ` for standard steps)
+- Putting ` + "`model`" + ` or ` + "`output`" + ` at step level for ` + "`generate`" + ` steps (they belong inside the ` + "`generate:`" + ` block)
+- Using tabs instead of spaces for indentation
 
 ## 1. Standard Processing Step Definition
 
@@ -420,6 +1726,962 @@ step_name_for_processing:
 - ` + "`inputs`" + `: (map, optional) A map of key-value pairs to pass as initial variables to the sub-workflow. These can be accessed within the sub-workflow (e.g., as ` + "`$parent.key1`" + `).
 - **Note:** The ` + "`input`" + ` field for a ` + "`process`" + ` step is optional. If ` + "`input: STDIN`" + ` is used, the output of the previous step in the parent workflow will be available as the initial ` + "`STDIN`" + ` for the *first* step of the sub-workflow if that first step expects ` + "`STDIN`" + `.
 
+## Durable Semantic Memory (memory)
+
+Use semantic memory only when a step needs durable facts from separate runs or sessions, such as previous decisions, constraints, failures, or findings. It is optional; ordinary one-shot workflows and loops that only need current-iteration context should omit it.
+
+Example:
+
+    review:
+      input: STDIN
+      model: openai-codex
+      memory:
+        namespace: project
+        recall:
+          query: input
+          limit: 6
+          max_chars: 6000
+          types: [decision, constraint, failure]
+      action: "Use relevant durable facts as evidence and cite their IDs."
+      output: STDOUT
+
+- memory: true is the legacy mode that injects the full configured COMANDA.md file. Use the mapping above for bounded semantic recall.
+- Memory is seeded explicitly with comanda memory add; model output is not automatically stored as durable memory.
+- In a block-style agentic-loop with explicit steps:, put memory: on every inner step that needs recall. Do not put it under agentic-loop.config and do not assume a parent setting is inherited.
+
+## Knowledge Graph Context (graph_node recall)
+
+A codebase index can be turned into a knowledge graph stored in the semantic memory database: typed nodes for components, packages, files, types, and functions, connected by confidence-tagged edges (EXTRACTED vs INFERRED). The graph is built outside workflows with the CLI: comanda index capture -n <name> --graph, or comanda graph build <name> on a registered index. There is no workflow step type for building graphs, and no knowledge_graph or graph: field in the DSL.
+
+Every graph node is mirrored as a graph_node memory record in the <name> namespace, so steps consume the graph through the standard memory mapping by adding graph_node to recall.types, typically alongside decision and constraint. The memory namespace must match the index name.
+
+Use graph_node recall when a step or agentic loop needs durable codebase structure context (which files, packages, types, and functions exist and how they connect) instead of re-scanning the repository each iteration. Recall is bounded by limit and max_chars, so long loops get focused context rather than the whole index.
+
+Example (agentic loop step with codebase context):
+
+    implement:
+      input: $PLAN
+      model: openai-codex
+      memory:
+        namespace: myproject
+        recall:
+          query: input
+          limit: 8
+          max_chars: 6000
+          types: [graph_node, decision, constraint]
+      action: "Implement using the recalled graph nodes as a codebase map; cite node IDs you rely on."
+      output: STDOUT
+
+- Build or refresh the graph before running the workflow (comanda graph update <name>); workflows only read it.
+- Graph recall works only through memory.recall.types; do not invent graph-specific DSL fields.
+
+## 4. Agentic Loop Step Definition (` + "`agentic_loop`" + ` / ` + "`agentic-loop`" + `)
+
+Agentic loops enable iterative LLM processing until an exit condition is met. This is powerful for tasks that require refinement, multi-step reasoning, or autonomous decision-making.
+
+**⚠️ DEFAULT TO LINEAR WORKFLOWS. Use agentic loops ONLY when true iteration is required.**
+
+**When to use agentic loops (ONLY for genuine iteration):**
+- Iterative code improvement where quality gates determine completion (analyze → fix → verify until tests pass)
+- Tasks where the number of iterations is genuinely unknown and the LLM must decide when done
+- Autonomous retry loops driven by external feedback (e.g., test failures, validator output)
+
+**When NOT to use agentic loops — use linear steps instead:**
+- Reading named input files, consulting reference documents, writing to a specified output — ALWAYS linear
+- Any "read A, consult B, process C, write output.md" pattern — LINEAR, not agentic
+- Workflows with defined inputs and a specified output format — use linear steps
+- Document analysis, report generation, financial analysis, credit underwriting, data extraction — linear workflows
+- When all steps are known in advance and each executes exactly once — use linear steps
+
+### Inline Syntax (Single-Step Loop)
+
+For simple iterative tasks with a single step:
+
+` + "```yaml" + `
+step_name:
+  agentic_loop:
+    max_iterations: 5           # Safety limit (default: 10)
+    exit_condition: pattern_match  # or "llm_decides"
+    exit_pattern: "COMPLETE"    # Regex pattern for pattern_match
+  input: STDIN
+  model: claude-code
+  action: |
+    Iteration {{ loop.iteration }}.
+    Previous work: {{ loop.previous_output }}
+
+    Continue improving. Say COMPLETE when done.
+  output: STDOUT
+` + "```" + `
+
+### Block Syntax (Multi-Step Loop)
+
+For complex loops with multiple sub-steps per iteration:
+
+` + "```yaml" + `
+agentic-loop:
+  config:
+    max_iterations: 5           # Safety limit (default: 10)
+    timeout_seconds: 300        # Total timeout (default: 300)
+    codex_timeout_seconds: 1200 # Per-Codex-command timeout (default: 20 minutes)
+    exit_condition: llm_decides # or "pattern_match"
+    exit_pattern: "DONE"        # For pattern_match
+    context_window: 3           # Past iterations to include (default: 5)
+
+  steps:
+    plan:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }}.
+        Previous: {{ loop.previous_output }}
+
+        Plan next steps. Say DONE if complete.
+      output: $PLAN
+
+    execute:
+      input: $PLAN
+      model: claude-code
+      action: "Execute the plan"
+      output: STDOUT
+` + "```" + `
+
+**` + "`agentic_loop`" + ` Configuration:**
+
+**Core Settings:**
+- ` + "`max_iterations`" + `: (int, default: 10) Maximum iterations before stopping.
+- ` + "`timeout_seconds`" + `: (int, default: 0) Total time limit in seconds. **0 = no timeout** (loop runs until max_iterations or exit condition).
+- ` + "`codex_timeout_seconds`" + `: (int, default: 1200) Per-command watchdog for ` + "`openai-codex`" + ` loop steps. Set a positive value to override it; **0 uses the 20-minute provider default**. This does not change the loop-wide ` + "`timeout_seconds`" + ` setting.
+- ` + "`exit_condition`" + `: (string) How to detect completion:
+  - ` + "`llm_decides`" + `: Exits when output ends with "DONE", "COMPLETE", or "FINISHED" (case-insensitive). Works when these words appear at the very end of the output, at the end of any line, or as the entire output.
+  - ` + "`pattern_match`" + `: Exits when output matches ` + "`exit_pattern`" + ` regex
+- ` + "`exit_pattern`" + `: (string) Regex pattern for ` + "`pattern_match`" + ` condition.
+- ` + "`context_window`" + `: (int, default: 5) Number of past iterations to include in context.
+
+**File Access (REQUIRED for Claude Code):**
+- ` + "`allowed_paths`" + `: (list, **REQUIRED for file operations**) Directories where Claude Code can use tools (Read, Write, Edit, Bash, etc.). **Without this, Claude Code runs in print-only mode and CANNOT read/write files.** When generating workflows, infer paths from: the ` + "`codebase_index.root`" + ` if present, file paths mentioned in the action, or use ` + "`[.]`" + ` (current directory) as fallback.
+- ` + "`tools`" + `: (list, optional) Restrict available tools (e.g., ` + "`[Read, Glob, Grep]`" + ` for read-only access). If omitted, all tools are available.
+
+**State Persistence (for Long-Running Loops):**
+- ` + "`name`" + `: (string, **REQUIRED for stateful loops**) Unique identifier for the loop. Enables state persistence and resume capability.
+- ` + "`stateful`" + `: (bool, default: false) Enable state persistence to ` + "`~/.comanda/loop-states/{name}.json`" + `. Allows resuming after interruption.
+- ` + "`checkpoint_interval`" + `: (int, default: 5) Save state every N iterations. Lower values = more frequent saves = safer resume.
+
+**Quality Gates (Automated Validation):**
+- ` + "`quality_gates`" + `: (list, optional) Automated checks to run after each iteration. Each gate validates loop output and can trigger retry/abort/skip actions.
+
+**Quality Gate Configuration:**
+` + "```yaml" + `
+quality_gates:
+  - name: typecheck           # Gate name
+    command: "npm run typecheck"  # Shell command to execute
+    on_fail: retry            # Action: retry, abort, or skip
+    timeout: 60               # Timeout in seconds
+    retry:                    # Retry configuration (optional)
+      max_attempts: 3         # Maximum retry attempts
+      backoff_type: exponential  # linear or exponential
+      initial_delay: 5        # Initial delay in seconds
+
+  - name: security
+    type: security            # Built-in gate type (syntax, security, test)
+    on_fail: abort
+
+  - name: tests
+    command: "npm test"
+    on_fail: skip             # Continue even if this fails
+` + "```" + `
+
+**Built-in Quality Gate Types:**
+- ` + "`syntax`" + `: Checks for syntax errors (Python, JS, Go, etc.)
+- ` + "`security`" + `: Scans for hardcoded secrets, security issues
+- ` + "`test`" + `: Runs test commands with coverage reporting
+
+**Quality Gate Actions (` + "`on_fail`" + `):**
+- ` + "`retry`" + `: Retry the gate with backoff (exponential or linear)
+- ` + "`abort`" + `: Stop loop immediately and save state as "failed"
+- ` + "`skip`" + `: Log warning and continue to next iteration
+
+**Template Variables in Actions:**
+- ` + "`{{ loop.iteration }}`" + `: Current iteration number (1-based)
+- ` + "`{{ loop.previous_output }}`" + `: Output from previous iteration
+- ` + "`{{ loop.total_iterations }}`" + `: Maximum allowed iterations
+- ` + "`{{ loop.elapsed_seconds }}`" + `: Seconds since loop started
+
+**Example: Agentic Code Exploration**
+` + "```yaml" + `
+explore_codebase:
+  agentic_loop:
+    max_iterations: 3
+    exit_condition: llm_decides
+    allowed_paths: [./src, ./tests]
+    tools: [Read, Glob, Grep]  # Read-only access
+  input: STDIN
+  model: claude-code
+  action: |
+    Explore the codebase and answer: {{ loop.previous_output }}
+    Say DONE when you have the answer.
+  output: STDOUT
+` + "```" + `
+
+**Example: Iterative Code Implementation**
+` + "```yaml" + `
+implement:
+  agentic_loop:
+    max_iterations: 3
+    exit_condition: pattern_match
+    exit_pattern: "SATISFIED"
+    allowed_paths: [.]  # Required for file operations
+  input: STDIN
+  model: claude-code
+  action: |
+    Iteration {{ loop.iteration }}. Implement and improve the code.
+    Previous: {{ loop.previous_output }}
+
+    Add error handling, edge cases, tests.
+    Say SATISFIED when production-ready.
+  output: STDOUT
+` + "```" + `
+
+**Example: Plan and Build Loop**
+` + "```yaml" + `
+agentic-loop:
+  config:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]  # Required for file operations
+
+  steps:
+    plan:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }}.
+        Create/refine the implementation plan.
+        Say DONE when ready to implement.
+      output: $PLAN
+
+    build:
+      input: $PLAN
+      model: claude-code
+      action: "Generate code based on the plan"
+      output: STDOUT
+` + "```" + `
+
+**Example: Long-Running Loop with State Persistence**
+` + "```yaml" + `
+agentic-loop:
+  config:
+    name: code-refactor-loop      # Required for stateful loops
+    stateful: true                 # Enable state persistence
+    max_iterations: 50
+    timeout_seconds: 0             # No timeout - run until complete
+    checkpoint_interval: 5         # Save every 5 iterations
+    exit_condition: llm_decides
+    allowed_paths: [./src]
+
+    quality_gates:
+    name: syntax-check
+        type: syntax
+        on_fail: retry
+        retry:
+          max_attempts: 3
+          backoff_type: exponential
+          initial_delay: 2
+
+    name: tests
+        command: "npm test"
+        on_fail: abort              # Stop if tests fail
+        timeout: 300
+
+  steps:
+    analyze:
+      input: STDIN
+      model: claude-code
+      action: |
+        Iteration {{ loop.iteration }} of {{ loop.total_iterations }}.
+        Analyze code and refactor one module.
+        Say DONE when all modules are refactored.
+      output: STDOUT
+` + "```" + `
+
+**Example: Quality Gates with Retry**
+` + "```yaml" + `
+code_improvement:
+  agentic_loop:
+    name: improve-code
+    stateful: true
+    max_iterations: 10
+    allowed_paths: [.]
+
+    quality_gates:
+    name: typecheck
+        command: "npm run typecheck"
+        on_fail: retry
+        timeout: 60
+        retry:
+          max_attempts: 3
+          backoff_type: exponential
+          initial_delay: 5
+
+    name: lint
+        command: "npm run lint"
+        on_fail: skip               # Non-critical, continue
+
+  input: STDIN
+  model: claude-code
+  action: "Improve code quality. Say COMPLETE when done."
+  output: STDOUT
+` + "```" + `
+
+**CRITICAL: When generating agentic_loop workflows with Claude Code:**
+- **ALWAYS include ` + "`allowed_paths`" + `** - Claude Code CANNOT read/write files without it
+- If the workflow uses ` + "`codebase_index`" + `, use the same ` + "`root`" + ` directory in ` + "`allowed_paths`" + `
+- If the action mentions specific file paths or directories, include those directories
+- When in doubt, use ` + "`allowed_paths: [.]`" + ` for current directory access
+- Forgetting ` + "`allowed_paths`" + ` is a common error that causes "permission denied" failures
+- For long-running tasks (hours/days), use ` + "`stateful: true`" + ` and ` + "`timeout_seconds: 0`" + `
+- **Default to ` + "`claude-code`" + ` model for agentic workflows** - it provides the best tool use and autonomous capabilities
+
+## 5. Multi-Loop Orchestration
+
+Multi-loop orchestration enables complex autonomous workflows with multiple interdependent agentic loops. This is essential for creator/checker patterns, sequential processing pipelines, and complex task decomposition.
+
+**When to use multi-loop orchestration:**
+- Creator/checker validation workflows (loop A creates, loop B validates, rerun A if validation fails)
+- Sequential data processing (collect → analyze → report)
+- Complex task decomposition (break large task into specialized sub-loops)
+- Workflows requiring variable passing between autonomous agents
+
+### Named Loops Syntax
+
+Define multiple named loops with dependencies and variable passing:
+
+` + "```yaml" + `
+loops:
+  data-collector:
+    name: data-collector
+    stateful: true
+    max_iterations: 10
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $RAW_DATA         # Export result to variable
+
+    steps:
+    collect:
+          input: STDIN
+          model: claude-code
+          action: "Collect data and say DONE when complete"
+          output: STDOUT
+
+  data-analyzer:
+    name: data-analyzer
+    depends_on: [data-collector]    # Wait for collector to complete
+    input_state: $RAW_DATA           # Read collector's output
+    stateful: true
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $ANALYSIS          # Export analysis result
+
+    steps:
+    analyze:
+          input: STDIN
+          model: claude-code
+          action: |
+            Analyze this data: {{ loop.previous_output }}
+            Say DONE when analysis is complete.
+          output: STDOUT
+
+  report-generator:
+    name: report-generator
+    depends_on: [data-analyzer]     # Wait for analyzer
+    input_state: $ANALYSIS           # Read analyzer's output
+    max_iterations: 1
+    allowed_paths: [.]
+
+    steps:
+    generate:
+          input: STDIN
+          model: claude-code
+          action: "Create final report based on analysis"
+          output: STDOUT
+
+# Execute loops in dependency order (topological sort)
+execute_loops:
+  - data-collector
+  - data-analyzer
+  - report-generator
+` + "```" + `
+
+**Key Configuration Fields:**
+- ` + "`loops`" + `: (map) Named loop definitions
+- ` + "`depends_on`" + `: (list) Loops that must complete before this one starts
+- ` + "`input_state`" + `: (string) Variable to read as input (e.g., ` + "`$RAW_DATA`" + `)
+- ` + "`output_state`" + `: (string) Variable to export result to (e.g., ` + "`$ANALYSIS`" + `)
+- ` + "`execute_loops`" + `: (list) Simple execution order (dependencies override this)
+
+### Creator/Checker Pattern
+
+Advanced workflow pattern where a creator loop implements features and a checker loop validates them, with automatic rerun on failure:
+
+` + "```yaml" + `
+loops:
+  # Creator loop: implements features
+  feature-creator:
+    name: feature-creator
+    stateful: true
+    max_iterations: 3
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [.]
+    output_state: $CODE
+
+    quality_gates:
+    name: syntax
+        type: syntax
+        on_fail: abort
+
+    steps:
+    implement:
+          input: STDIN
+          model: claude-code
+          action: |
+            Iteration {{ loop.iteration }}.
+            Implement the requested feature.
+            Say DONE when implementation is complete.
+          output: STDOUT
+
+  # Checker loop: validates implementation
+  code-checker:
+    name: code-checker
+    depends_on: [feature-creator]   # Wait for creator
+    input_state: $CODE               # Read creator's output
+    max_iterations: 1
+    exit_condition: pattern_match
+    exit_pattern: "^PASS"            # Exit when output starts with PASS
+
+    steps:
+    review:
+          input: STDIN
+          model: claude-code
+          action: |
+            Review this implementation: {{ loop.previous_output }}
+
+            Check for:
+            - Correctness
+            - Edge cases
+            - Code quality
+            - Test coverage
+
+            Output: PASS if acceptable, or FAIL with specific issues.
+          output: STDOUT
+
+# Advanced workflow with creator/checker relationship
+workflow:
+  creator:
+    type: loop
+    loop: feature-creator
+    role: creator
+
+  checker:
+    type: loop
+    loop: code-checker
+    role: checker
+    validates: creator               # This loop validates the creator
+    on_fail: rerun_creator          # Auto-rerun creator if validation fails
+` + "```" + `
+
+**Workflow Node Configuration:**
+- ` + "`type`" + `: Always ` + "`loop`" + ` for loop nodes
+- ` + "`loop`" + `: Name of the loop to execute
+- ` + "`role`" + `: Node role (` + "`creator`" + `, ` + "`checker`" + `, ` + "`finalizer`" + `)
+- ` + "`validates`" + `: Name of the node this checker validates
+- ` + "`on_fail`" + `: Action on validation failure:
+  - ` + "`rerun_creator`" + `: Automatically rerun the creator loop (max 3 attempts)
+  - ` + "`abort`" + `: Stop workflow immediately
+  - ` + "`manual`" + `: Return for manual review
+
+**Validation Logic:**
+- Checker loop output is scanned for "PASS" or "FAIL"
+- If "PASS" found → workflow continues
+- If "FAIL" found and ` + "`on_fail: rerun_creator`" + ` → creator reruns with checker feedback
+- Maximum 3 rerun attempts (prevents infinite loops)
+
+### Dependency Graph Execution
+
+Comanda automatically executes loops in correct order using topological sort:
+
+1. **Build dependency graph** from ` + "`depends_on`" + ` relationships
+2. **Detect cycles** - fail fast if circular dependencies exist
+3. **Topological sort** using Kahn's algorithm
+4. **Execute in order** - each loop waits for its dependencies
+
+**Cycle Detection Example:**
+` + "```yaml" + `
+loops:
+  loop-a:
+    depends_on: [loop-b]
+
+  loop-b:
+    depends_on: [loop-a]
+
+execute_loops:
+  - loop-a
+  - loop-b
+
+# Error: dependency cycle detected: loop-a -> loop-b -> loop-a
+` + "```" + `
+
+### Variable Passing
+
+Variables flow between loops via ` + "`input_state`" + ` and ` + "`output_state`" + `:
+
+` + "```yaml" + `
+loops:
+  producer:
+    output_state: $MY_DATA          # Write to variable
+
+  consumer:
+    depends_on: [producer]
+    input_state: $MY_DATA            # Read from variable
+` + "```" + `
+
+**Variable Rules:**
+- Variables are stored in memory during workflow execution
+- ` + "`output_state`" + ` exports loop's final output to a variable
+- ` + "`input_state`" + ` reads variable as loop input
+- Variables persist across loop boundaries
+- Missing variable causes error (check dependencies)
+
+### Complete Example: Codebase Analysis Pipeline
+
+` + "```yaml" + `
+# Multi-loop workflow: analyze codebase → identify issues → generate report
+loops:
+  codebase-analyzer:
+    name: codebase-analyzer
+    stateful: true
+    max_iterations: 20
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [/tmp/code]
+    output_state: $ANALYSIS
+
+    steps:
+    analyze:
+          input: NA
+          model: claude-code
+          action: |
+            Analyze the codebase at /tmp/code.
+            Find patterns, architecture issues, dependencies.
+            Say DONE when analysis is complete.
+          output: STDOUT
+
+  tech-debt-finder:
+    name: tech-debt-finder
+    depends_on: [codebase-analyzer]
+    input_state: $ANALYSIS
+    stateful: true
+    max_iterations: 10
+    timeout_seconds: 0
+    exit_condition: llm_decides
+    allowed_paths: [/tmp/code]
+    output_state: $TECH_DEBT
+
+    steps:
+    identify:
+          input: STDIN
+          model: claude-code
+          action: |
+            Based on this analysis: {{ loop.previous_output }}
+
+            Identify tech debt and anti-patterns:
+            - Code smells
+            - Security issues
+            - Performance bottlenecks
+            - Maintainability problems
+
+            Say DONE when complete.
+          output: STDOUT
+
+  report-writer:
+    name: report-writer
+    depends_on: [tech-debt-finder]
+    input_state: $TECH_DEBT
+    max_iterations: 1
+    allowed_paths: [.]
+
+    steps:
+    write:
+          input: STDIN
+          model: claude-code
+          action: |
+            Create a comprehensive markdown report:
+            {{ loop.previous_output }}
+
+            Save to ./tech-debt-report.md
+          output: STDOUT
+
+execute_loops:
+  - codebase-analyzer
+  - tech-debt-finder
+  - report-writer
+` + "```" + `
+
+**CRITICAL: When generating multi-loop workflows:**
+- **Use ` + "`claude-code`" + ` as default model** for agentic capabilities
+- **Always include ` + "`allowed_paths`" + `** for each loop that needs file access
+- **Use ` + "`stateful: true`" + `** for long-running loops
+- **Set ` + "`timeout_seconds: 0`" + `** for unlimited runtime
+- **Use meaningful variable names** (` + "`$RAW_DATA`" + `, not ` + "`$OUTPUT`" + `)
+- **Infer ` + "`allowed_paths`" + ` from user prompt** (e.g., "/tmp/code" → ` + "`allowed_paths: [/tmp/code]`" + `)
+- **Default ` + "`checkpoint_interval: 5`" + `** for safety
+
+### Using Codebase Index with Multi-Loop Workflows
+
+**⚠️ CRITICAL:** When using ` + "`execute_loops:`" + `, **ONLY the loops are executed**. Top-level steps (outside the ` + "`loops:`" + ` block) are IGNORED.
+
+❌ **WRONG** - Top-level codebase-index step will NOT run:
+` + "```yaml" + `
+# This step is IGNORED when using execute_loops!
+index_core:
+  step_type: codebase-index
+  codebase_index:
+    root: ~/my-project
+
+loops:
+  analyze:
+    steps:
+      step1:
+        input: $MY_PROJECT_INDEX  # ❌ Variable never set!
+        model: claude-code
+        action: "Analyze the codebase"
+        output: STDOUT
+
+execute_loops:
+  - analyze
+` + "```" + `
+
+✅ **CORRECT** - Reference the output file path directly:
+` + "```yaml" + `
+loops:
+  analyze:
+    allowed_paths: [~/my-project, .]
+    steps:
+      # First step: Generate the index
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/my-project
+          output:
+            path: .comanda/MY_PROJECT_INDEX.md
+            store: repo
+
+      # Subsequent steps: Read the index file directly
+      analyze:
+        input: .comanda/MY_PROJECT_INDEX.md
+        model: claude-code
+        action: "Analyze this codebase index"
+        output: STDOUT
+
+execute_loops:
+  - analyze
+` + "```" + `
+
+✅ **ALSO CORRECT** - Use input_state to pass index between loops:
+` + "```yaml" + `
+loops:
+  indexer:
+    max_iterations: 1
+    allowed_paths: [~/my-project]
+    output_state: $CODEBASE_INDEX
+    steps:
+      index:
+        step_type: codebase-index
+        codebase_index:
+          root: ~/my-project
+        output: STDOUT
+
+  analyzer:
+    depends_on: [indexer]
+    input_state: $CODEBASE_INDEX
+    allowed_paths: [~/my-project, .]
+    steps:
+      analyze:
+        input: STDIN
+        model: claude-code
+        action: |
+          Codebase index:
+          {{ loop.previous_output }}
+
+          Analyze the architecture.
+        output: STDOUT
+
+execute_loops:
+  - indexer
+  - analyzer
+` + "```" + `
+
+
+## 6. Codebase Index Step Definition (` + "`codebase_index`" + `)
+
+This step scans a repository and generates a compact Markdown index optimized for LLM consumption. It supports multiple programming languages and exposes workflow variables for downstream steps.
+
+**When to use codebase-index:**
+- When you need to give an LLM context about a codebase structure
+- Before code analysis, refactoring, or documentation tasks
+- When building workflows that operate on unfamiliar repositories
+
+**Structure:**
+` + "```yaml" + `
+step_name:
+  step_type: codebase-index  # Alternative: use codebase_index block
+  codebase_index:
+    root: .                   # Repository path (default: current directory)
+    output:
+      path: .comanda/INDEX.md # Custom output path (optional)
+      format: structured      # Output format: summary, structured, full
+      store: repo             # Where to store: repo, config, or both
+      encrypt: false          # Enable AES-256 encryption
+    expose:
+      workflow_variable: true # Export as workflow variables
+      memory:
+        enabled: true         # Register as memory source
+        key: repo.index       # Memory key name
+    adapters:                 # Per-language configuration (optional)
+      go:
+        ignore_dirs: [vendor, testdata]
+        priority_files: ["cmd/**/*.go"]
+    max_output_kb: 100        # Maximum output size in KB
+    enhance: false            # Optional second-pass AI macro analysis
+    enhance_model: claude-code # Optional; defaults to default_generation_model
+    qmd:                      # qmd integration (optional)
+      collection: myproject   # Register index as qmd collection
+      context: "Project source code"  # Description for search relevance
+      embed: false            # Run qmd embed after (slow, enables semantic search)
+` + "```" + `
+
+**` + "`codebase_index`" + ` Block Attributes:**
+- ` + "`root`" + `: (string, default: ` + "`.`" + `) Repository path to scan.
+- ` + "`output.path`" + `: (string, optional) Custom output file path. Default: ` + "`.comanda/<repo>_INDEX.md`" + `
+- ` + "`output.format`" + `: (string, default: ` + "`structured`" + `) Output format: ` + "`summary`" + ` (compact 1-2KB for system prompts), ` + "`structured`" + ` (balanced with sections), or ` + "`full`" + ` (detailed with all symbols).
+- ` + "`output.store`" + `: (string, default: ` + "`repo`" + `) Where to save: ` + "`repo`" + ` (in repository), ` + "`config`" + ` (~/.comanda/), or ` + "`both`" + `.
+- ` + "`output.encrypt`" + `: (bool, default: false) Encrypt output with AES-256 GCM. Saves as ` + "`.enc`" + ` file. Requires ` + "`COMANDA_INDEX_KEY`" + ` environment variable.
+- ` + "`expose.workflow_variable`" + `: (bool, default: true) Export index as workflow variables.
+- ` + "`expose.memory.enabled`" + `: (bool, default: false) Register as a named memory source.
+- ` + "`expose.memory.key`" + `: (string) Key name for memory access.
+- ` + "`adapters`" + `: (map, optional) Per-language configuration overrides.
+- ` + "`max_output_kb`" + `: (int, default: 100) Maximum size of generated index.
+- ` + "`enhance`" + `: (bool, default: false) Run a second AI pass with the default generation model to add macro architecture analysis, component boundaries, frontend/backend patterns, and an agent change playbook.
+- ` + "`enhance_model`" + `: (string, optional) Model for ` + "`enhance`" + `; defaults to configured ` + "`default_generation_model`" + `.
+- Knowledge graph: after capturing an index, comanda index capture --graph or comanda graph build <name> turns it into a queryable knowledge graph stored in semantic memory; steps consume it via memory recall with types: [graph_node]. See the Knowledge Graph Context section.
+- ` + "`qmd.collection`" + `: (string, optional) Register index as a qmd collection with this name.
+- ` + "`qmd.context`" + `: (string, optional) Description for the collection (improves search relevance).
+- ` + "`qmd.embed`" + `: (bool, default: false) Run ` + "`qmd embed`" + ` after indexing (enables semantic search, slow).
+
+**Workflow Variables Exported:**
+
+After the step runs, these variables are available (where ` + "`<REPO>`" + ` is the uppercase repository name, e.g., ` + "`src`" + ` becomes ` + "`SRC`" + `):
+- ` + "`$<REPO>_INDEX`" + `: Full Markdown content of the index
+- ` + "`$<REPO>_INDEX_PATH`" + `: Absolute path to the saved index file
+- ` + "`$<REPO>_INDEX_SHA`" + `: Hash of the index content
+- ` + "`$<REPO>_INDEX_UPDATED`" + `: ` + "`true`" + ` if index was regenerated
+
+**⚠️ CRITICAL: Referencing the Index in Subsequent Steps**
+
+When a later step needs the codebase index content, you MUST use the exported variable — NOT the file path.
+
+✅ **CORRECT** - Use the exported variable:
+` + "```yaml" + `
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./src
+
+analyze_codebase:
+  input: $SRC_INDEX          # ✅ Use the variable!
+  model: claude-code
+  action: "Analyze this codebase structure"
+  output: STDOUT
+` + "```" + `
+
+❌ **WRONG** - Do NOT use the file path directly:
+` + "```yaml" + `
+index_codebase:
+  step_type: codebase-index
+  codebase_index:
+    root: ./src
+    output:
+      path: .comanda/INDEX.md
+
+analyze_codebase:
+  input: .comanda/INDEX.md    # ❌ WRONG! Path may not resolve correctly
+  model: claude-code
+  action: "Analyze this codebase structure"
+  output: STDOUT
+` + "```" + `
+
+**Why?** The ` + "`output.path`" + ` is relative to the repository root (when ` + "`store: repo`" + `), not the current working directory. The exported variable always contains the correct content regardless of where you run the workflow.
+
+**Supported Languages:**
+- **Go**: Uses AST parsing. Detection: ` + "`go.mod`" + `, ` + "`go.sum`" + `
+- **Python**: Uses regex. Detection: ` + "`pyproject.toml`" + `, ` + "`requirements.txt`" + `, ` + "`setup.py`" + `
+- **TypeScript/JavaScript**: Uses regex. Detection: ` + "`tsconfig.json`" + `, ` + "`package.json`" + `
+- **Flutter/Dart**: Uses regex. Detection: ` + "`pubspec.yaml`" + `
+- **Java**: Uses regex. Detection: ` + "`pom.xml`" + `, ` + "`build.gradle`" + `, ` + "`build.gradle.kts`" + `
+
+**Example: Index and Analyze a Codebase**
+` + "```yaml" + `
+# Step 1: Generate codebase index
+index_repo:
+  step_type: codebase-index
+  codebase_index:
+    root: ./my-project
+    expose:
+      workflow_variable: true
+
+# Step 2: Use the index for analysis
+analyze_architecture:
+  input: STDIN
+  model: claude-code
+  action: |
+    Here is the codebase index:
+    $MY_PROJECT_INDEX
+
+    Analyze the architecture and suggest improvements.
+  output: STDOUT
+` + "```" + `
+
+**Example: Minimal Usage**
+` + "```yaml" + `
+index_repo:
+  step_type: codebase-index
+  codebase_index:
+    root: .
+` + "```" + `
+
+### Using the Index Registry
+
+Indexes can be pre-captured using ` + "`comanda index capture`" + `, then loaded without regenerating:
+
+**Loading from Registry:**
+` + "```yaml" + `
+load_index:
+  codebase_index:
+    use: myproject              # Load from registry
+    max_age: 24h                # Warn if stale
+
+load_multiple:
+  codebase_index:
+    use: [project1, project2]   # Load multiple indexes
+    aggregate: true             # Create $AGGREGATED_INDEX
+` + "```" + `
+
+**Inline Index References (` + "`${INDEX:name}`" + `):**
+` + "```yaml" + `
+analyze:
+  input: |
+    Context: ${INDEX:myproject}
+    Review the architecture.
+  model: claude
+  output: STDOUT
+` + "```" + `
+
+
+## 7. qmd Search Step Definition (` + "`qmd_search`" + `)
+
+This step searches local knowledge bases using qmd, providing BM25, vector, or hybrid search capabilities.
+
+**When to use qmd-search:**
+- Retrieval-Augmented Generation (RAG) workflows
+- Searching indexed codebases or documentation
+- Finding relevant context before LLM processing
+
+**Prerequisites:**
+- Install qmd: ` + "`bun install -g @tobilu/qmd`" + `
+- Create a collection: ` + "`qmd collection add ./docs --name docs`" + `
+
+**Structure:**
+` + "```yaml" + `
+step_name:
+  type: qmd-search
+  qmd_search:
+    query: "${QUESTION}"      # Search query (supports variable substitution)
+    collection: docs          # Optional: restrict to specific collection
+    mode: search              # search (BM25), vsearch (vector), query (hybrid)
+    limit: 5                  # Number of results (default: 5)
+    min_score: 0.3            # Minimum relevance score (0.0-1.0)
+    format: text              # Output format: text (default), json, files
+  output: CONTEXT             # Store results in variable
+` + "```" + `
+
+**` + "`qmd_search`" + ` Block Attributes:**
+- ` + "`query`" + `: (string, required) Search query. Supports variable substitution (e.g., ` + "`${QUESTION}`" + `).
+- ` + "`collection`" + `: (string, optional) Restrict search to a specific qmd collection.
+- ` + "`mode`" + `: (string, default: ` + "`search`" + `) Search mode:
+  - ` + "`search`" + `: BM25 keyword search (fastest, recommended default)
+  - ` + "`vsearch`" + `: Vector/semantic search (slower, requires embeddings)
+  - ` + "`query`" + `: Hybrid search with LLM reranking (slowest, best quality)
+- ` + "`limit`" + `: (int, default: 5) Maximum number of results to return.
+- ` + "`min_score`" + `: (float, optional) Minimum relevance score threshold (0.0-1.0).
+- ` + "`format`" + `: (string, default: ` + "`text`" + `) Output format:
+  - ` + "`text`" + `: Human-readable text output
+  - ` + "`json`" + `: Structured JSON output
+  - ` + "`files`" + `: List of matching file paths only
+- ` + "`full`" + `: (bool, default: false) Return full document content instead of snippets.
+
+**Example: RAG Workflow**
+` + "```yaml" + `
+# Search for relevant context
+retrieve_context:
+  type: qmd-search
+  qmd_search:
+    query: "${USER_QUESTION}"
+    collection: docs
+    mode: search
+    limit: 5
+  output: CONTEXT
+
+# Generate answer with context
+generate_answer:
+  input: |
+    Context:
+    ${CONTEXT}
+    
+    Question: ${USER_QUESTION}
+  model: claude-sonnet
+  action: "Answer the question using only the provided context."
+  output: STDOUT
+` + "```" + `
+
+**Example: Code Search with codebase-index**
+` + "```yaml" + `
+# Index codebase with qmd registration
+index_code:
+  type: codebase-index
+  codebase_index:
+    root: ./src
+    qmd:
+      collection: mycode
+      context: "Application source code"
+
+# Search the indexed code
+find_relevant_code:
+  type: qmd-search
+  qmd_search:
+    query: "authentication middleware"
+    collection: mycode
+    limit: 10
+  output: RELEVANT_CODE
+
+# Analyze with LLM
+analyze_code:
+  input: ${RELEVANT_CODE}
+  model: claude-code
+  action: "Analyze these code snippets and suggest improvements."
+  output: STDOUT
+` + "```" + `
+
 ## Common Elements (for Standard Steps)
 
 ### Input Types
@@ -433,13 +2695,125 @@ step_name_for_processing:
 - List with aliases: ` + "`input: [file1.txt as $file1_content, file2.txt as $file2_content]`" + `
 
 ### Models
+
+**⚠️ CRITICAL MODEL RESTRICTION ⚠️**
+
+You **MUST ONLY** use models from the "Supported Models" list below. **DO NOT invent, guess, or use model names not explicitly listed.** Using unlisted model names will cause the workflow to fail at runtime.
+
+**Syntax:**
 - Single model: ` + "`model: gpt-4o-mini`" + `
 - No model (for non-LLM operations): ` + "`model: NA`" + `
 - Multiple models (for comparison): ` + "`model: [gpt-4o-mini, claude-3-opus-20240229]`" + `
-- **IMPORTANT**: When specifying a model, you **must** use one of the supported models listed below. Do not use model names that are not in this list.
 
-### Supported Models
+### Supported Models (USE ONLY THESE)
 {{SUPPORTED_MODELS}}
+
+**🚫 DO NOT USE** model names that are not in the list above. Common mistakes:
+- ❌ ` + "`gpt-4`" + ` (use ` + "`gpt-4o`" + ` or ` + "`gpt-4o-mini`" + ` instead)
+- ❌ ` + "`claude-3`" + ` (use the full model name like ` + "`claude-sonnet-4-5`" + `)
+- ❌ ` + "`gemini-pro`" + ` (use the exact name from the list above)
+- ❌ Any model name you are "pretty sure" exists - ONLY use names from the list
+
+### Claude Code Models (Local Agentic AI)
+
+**IMPORTANT: Recognizing Claude Code requests:**
+If the user's prompt mentions any of the following, they want to use a ` + "`claude-code`" + ` model:
+- "claude code" (case insensitive)
+- "Claude Code"
+- "use claude code"
+- "with claude code"
+- "using claude code"
+- "via claude code"
+- "claude-code"
+
+**What is Claude Code?**
+Claude Code (` + "`claude-code`" + `, ` + "`claude-code-opus`" + `, ` + "`claude-code-sonnet`" + `, ` + "`claude-code-haiku`" + `) is a special model family that uses the local Claude Code CLI (` + "`claude`" + ` binary) instead of API calls. It provides:
+- **Agentic capabilities**: Can autonomously perform multi-step tasks
+- **Local execution**: Runs via the Claude CLI installed on the user's machine
+- **Tool use**: Can interact with files, run commands, and perform complex operations
+
+**When to use Claude Code models:**
+- When the user explicitly mentions "claude code" in their request
+- When agentic/autonomous capabilities are needed
+- When the workflow should leverage Claude Code's tool-use abilities
+- When local CLI execution is preferred over API calls
+
+**Claude Code model variants:**
+- ` + "`claude-code`" + `: Base variant (uses default Claude Code model)
+- ` + "`claude-code-opus`" + `: Uses Claude Opus 4.5 (most capable)
+- ` + "`claude-code-sonnet`" + `: Uses Claude Sonnet 4.5 (balanced)
+- ` + "`claude-code-haiku`" + `: Uses Claude Haiku 4.5 (fastest/cheapest)
+
+**Example using Claude Code:**
+` + "```yaml" + `
+generate_haiku:
+  input: NA
+  model: claude-code
+  action: "Generate a beautiful haiku about nature"
+  output: STDOUT
+` + "```" + `
+
+### OpenAI Codex Models (Local Agentic AI)
+
+**IMPORTANT: Recognizing OpenAI Codex requests:**
+If the user's prompt mentions any of the following, they want to use an ` + "`openai-codex`" + ` model:
+- "openai codex" (case insensitive)
+- "OpenAI Codex"
+- "use codex"
+- "with codex"
+- "using codex"
+- "via codex"
+- "openai-codex"
+- just "codex" (when referring to the CLI tool)
+
+**What is OpenAI Codex?**
+OpenAI Codex is a special model family that uses the local OpenAI Codex CLI (` + "`codex`" + ` binary) instead of API calls. Comanda discovers the models available to the authenticated Codex CLI at runtime and exposes them as ` + "`openai-codex-<model-id>`" + ` (for example, ` + "`openai-codex-gpt-5.6-sol>`" + `). It provides:
+- **Agentic capabilities**: Can autonomously perform multi-step tasks
+- **Local execution**: Runs via the Codex CLI installed on the user's machine
+- **Tool use**: Can interact with files, run commands, and perform complex operations
+
+**When to use OpenAI Codex models:**
+- When the user explicitly mentions "codex" or "openai codex" in their request
+- When agentic/autonomous capabilities are needed with OpenAI models
+- When the workflow should leverage Codex's tool-use abilities
+- When local CLI execution is preferred over API calls
+
+**OpenAI Codex model variants:**
+- ` + "`openai-codex`" + `: Uses the configured Codex default.
+- ` + "`openai-codex-<model-id>`" + `: Uses one of the model IDs currently listed by the local Codex CLI. Use ` + "`comanda configure`" + ` to see the available values.
+
+**Example using OpenAI Codex:**
+` + "```yaml" + `
+generate_haiku:
+  input: NA
+  model: openai-codex
+  action: "Generate a beautiful haiku about nature"
+  output: STDOUT
+` + "```" + `
+
+### Model Selection Guidelines
+
+**CRITICAL: Choose models appropriate for task complexity:**
+
+**Use inexpensive/fast models (nano, mini, lite, flash, haiku) for:**
+- Simple text transformations and formatting
+- Data extraction and parsing
+- Straightforward summarization
+- Repetitive processing tasks
+- High-volume batch operations
+
+**Use flagship models (GPT-5.6 Sol, Grok 4.5, opus, pro, o1, o3) for:**
+- Complex reasoning and analysis
+- Creative writing and nuanced content
+- Multi-step problem solving
+- Tasks requiring deep understanding
+- Small token window tasks where quality matters most
+
+**Model tiers (from cheapest to most expensive):**
+- **Nano/Lite tier**: ` + "`gpt-5.6-luna`" + `, ` + "`gpt-5-nano`" + `, ` + "`gemini-2.5-flash-lite`" + `
+- **Mini/Flash tier**: ` + "`gpt-5-mini`" + `, ` + "`o4-mini`" + `, ` + "`o3-mini`" + `, ` + "`gemini-2.5-flash`" + `, ` + "`claude-haiku-4-5`" + `
+- **Standard tier**: ` + "`gpt-5.6-terra`" + `, ` + "`gpt-4.1`" + `, ` + "`grok-4.3`" + `, ` + "`gemini-2.5-pro`" + `, ` + "`claude-sonnet-4-5`" + `
+- **Flagship tier**: ` + "`gpt-5.6-sol`" + ` (or alias ` + "`gpt-5.6`" + `), ` + "`grok-4.5`" + `, ` + "`o3-pro`" + `, ` + "`claude-opus-4-5`" + `, ` + "`gemini-3-pro-preview`" + `
 
 ### Actions
 - Single instruction: ` + "`action: \"Summarize this text.\"`" + `
@@ -449,14 +2823,187 @@ step_name_for_processing:
 
 ### Outputs
 - Console: ` + "`output: STDOUT`" + `
-- File: ` + "`output: results.txt`" + `
+- File: ` + "`output: results.txt`" + ` or ` + "`output: ./path/to/output.md`" + `
 - Database: ` + "`output: { database: { type: \"postgres\", table: \"results_table\" } }`" + `
 - Output with alias (if supported for variable creation from output): ` + "`output: STDOUT as $step_output_var`" + `
 
-## Variables
+**⚠️ IMPORTANT: Writing to files**
+When the result should be saved to a file, use the ` + "`output:`" + ` field directly. Do NOT instruct the LLM to "write to a file" in the action.
+
+✅ **CORRECT** - Use ` + "`output:`" + ` for file writing:
+` + "```yaml" + `
+summarize_document:
+  input: report.txt
+  model: claude-code
+  action: "Summarize this document"
+  output: ./summary.md
+` + "```" + `
+
+❌ **WRONG** - Do NOT tell the LLM to write the file:
+` + "```yaml" + `
+summarize_document:
+  input: report.txt
+  model: claude-code
+  action: "Summarize this document and write it to ./summary.md"
+  output: STDOUT
+` + "```" + `
+
+### Tool Use (Shell Command Execution)
+
+Comanda supports executing shell commands as part of workflows using the ` + "`tool:`" + ` prefix.
+
+**Tool Input Formats:**
+- Simple command: ` + "`input: \"tool: ls -la\"`" + `
+- Pipe previous output to command: ` + "`input: \"tool: STDIN|grep pattern\"`" + `
+
+**Tool Output Formats:**
+- Pipe LLM output through command: ` + "`output: \"tool: jq '.data'\"`" + `
+- Pipe STDOUT through command: ` + "`output: \"STDOUT|grep pattern\"`" + `
+
+**Security Controls:**
+Tools execute with security controls - a default allowlist of safe read-only commands and a denylist of dangerous commands.
+
+**Safe commands (allowlist):** ` + "`ls`" + `, ` + "`cat`" + `, ` + "`head`" + `, ` + "`tail`" + `, ` + "`grep`" + `, ` + "`awk`" + `, ` + "`sed`" + `, ` + "`jq`" + `, ` + "`yq`" + `, ` + "`sort`" + `, ` + "`uniq`" + `, ` + "`wc`" + `, ` + "`cut`" + `, ` + "`tr`" + `, ` + "`diff`" + `, ` + "`find`" + `, ` + "`date`" + `, ` + "`echo`" + `, ` + "`base64`" + `, etc.
+
+**Blocked commands (denylist):** ` + "`rm`" + `, ` + "`sudo`" + `, ` + "`chmod`" + `, ` + "`curl`" + `, ` + "`wget`" + `, ` + "`ssh`" + `, ` + "`bash`" + `, ` + "`sh`" + `, etc.
+
+**Step-level tool configuration:**
+` + "```yaml" + `
+step_name:
+  input: "tool: ls -la"
+  model: NA
+  tool_config:
+    allowlist: [ls, cat, grep, jq]  # Override default allowlist
+    denylist: [rm]                  # Additional commands to block
+    timeout: 60                      # Timeout in seconds (default: 30)
+  action: NA
+  output: STDOUT
+` + "```" + `
+
+## Variables and Data Flow Between Steps
+
+Understanding when to use variables vs files is critical for building effective workflows.
+
+### Workflow Variables (` + "`$VARNAME`" + `)
 - Definition: ` + "`input: data.txt as $initial_data`" + `
 - Reference: ` + "`action: \"Compare this analysis with $initial_data\"`" + `
-- Scope: Variables are typically scoped to the workflow. For ` + "`process`" + ` steps, parent variables are not directly accessible by default; use the ` + "`process.inputs`" + ` map to pass data.
+- Scope: Variables are scoped to the workflow. For ` + "`process`" + ` steps, use the ` + "`process.inputs`" + ` map to pass data.
+
+### When to Use Variables vs Files
+
+**Use ` + "`$VARIABLES`" + ` for:**
+- **Ephemeral values** that are only needed within the workflow
+- **Small text** (under ~10KB) being passed between steps
+- **Loop state** in agentic loops (` + "`$PLAN`" + `, ` + "`$ANALYSIS`" + `, ` + "`$RESULT`" + `)
+- **Intermediate processing** that doesn't need to persist
+
+**Use **files** (` + "`.md`" + `, ` + "`.txt`" + `, ` + "`.json`" + `) for:**
+- **Persistent outputs** that users will want to access later
+- **Large content** (over ~10KB) - variables can bloat memory
+- **Multi-step independent access** - when step 3 needs output from both step 1 AND step 2
+- **Final deliverables** (reports, summaries, generated code)
+- **Audit trail** - when you need to see intermediate results
+
+### Chaining Patterns
+
+**Pattern 1: Sequential STDIN/STDOUT (simplest)**
+Use when each step only needs the previous step's output:
+` + "```yaml" + `
+extract_key_points:
+  input: document.txt
+  model: gpt-4o-mini
+  action: "Extract key points"
+  output: STDOUT
+
+translate_to_spanish:
+  input: STDIN  # Gets output from extract_key_points
+  model: gpt-4o-mini
+  action: "Translate to Spanish"
+  output: translated_points.md  # Final output saved to file
+` + "```" + `
+
+**Pattern 2: Variables for Agentic Loops**
+Use ` + "`$VARIABLES`" + ` within agentic loops to pass ephemeral state:
+` + "```yaml" + `
+agentic-loop:
+  config:
+    max_iterations: 5
+    exit_condition: llm_decides
+  steps:
+    plan_next_action:
+      input: STDIN
+      model: claude-code
+      action: "Plan the next step"
+      output: $PLAN  # Ephemeral - only needed for next step
+
+    execute_plan:
+      input: $PLAN  # Uses the variable
+      model: claude-code
+      action: "Execute the plan"
+      output: STDOUT
+` + "```" + `
+
+**Pattern 3: Files for Multi-Access**
+Use files when multiple steps need independent access:
+` + "```yaml" + `
+analyze_code_structure:
+  input: source_code.py
+  model: gpt-4o-mini
+  action: "Analyze code structure"
+  output: structure_analysis.md  # Save to file
+
+identify_security_issues:
+  input: source_code.py
+  model: gpt-4o-mini
+  action: "Identify security vulnerabilities"
+  output: security_report.md  # Save to file
+
+create_combined_report:
+  input: [structure_analysis.md, security_report.md]  # Access both files
+  model: gpt-4o-mini
+  action: "Create comprehensive report from both analysis outputs"
+  output: final_report.md
+` + "```" + `
+
+### Variable Naming Conventions
+
+Use **descriptive names** that indicate the content:
+- ✅ ` + "`$EXTRACTED_EMAILS`" + `, ` + "`$CODE_ANALYSIS`" + `, ` + "`$TRANSLATION_RESULT`" + `
+- ❌ ` + "`$OUTPUT`" + `, ` + "`$RESULT`" + `, ` + "`$DATA`" + `, ` + "`$TEMP`" + `
+
+## CLI Variables (Runtime Substitution)
+
+CLI variables allow runtime value injection using ` + "`--vars key=value`" + ` flags when running workflows:
+
+**Usage:**
+` + "```bash" + `
+# Single variable
+comanda process workflow.yaml --vars filename=/path/to/file.txt
+
+# Multiple variables
+comanda process workflow.yaml --vars key1=value1 --vars key2=value2
+
+# Map STDIN to a variable
+cat data.txt | comanda process workflow.yaml --vars data=STDIN
+` + "```" + `
+
+**In workflows, reference CLI variables with ` + "`{{varname}}`" + ` syntax:**
+` + "```yaml" + `
+step_name:
+  input: "tool: grep -E 'error' {{filename}}"
+  model: gpt-4o-mini
+  action: "Analyze {{project_name}} logs"
+  output: "{{output_dir}}/results.txt"
+` + "```" + `
+
+**Key differences from workflow variables (` + "`$varname`" + `):**
+- ` + "`{{varname}}`" + `: CLI-provided at runtime via ` + "`--vars`" + ` flag, substituted before processing
+- ` + "`$varname`" + `: Defined in workflow with ` + "`as $varname`" + ` syntax, scoped to workflow execution
+
+**When to use CLI variables:**
+- When the same workflow should work with different input files or parameters
+- When values need to be provided dynamically at runtime
+- When building reusable workflow templates
 
 ## Validation Rules Summary (for LLM)
 
@@ -476,6 +3023,26 @@ step_name_for_processing:
     *   ` + "`process`" + ` block must contain ` + "`workflow_file`" + ` (string path).
     *   ` + "`process.inputs`" + ` is optional.
     *   Top-level ` + "`input`" + ` for the step is optional (can be ` + "`NA`" + ` or ` + "`STDIN`" + ` to pipe to sub-workflow).
+5.  **Agentic Loop Step (Inline):**
+    *   Must contain an ` + "`agentic_loop`" + ` block with loop configuration.
+    *   Must also contain ` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + ` at the step level.
+    *   ` + "`agentic_loop.max_iterations`" + ` defaults to 10 if not specified.
+    *   ` + "`agentic_loop.exit_condition`" + ` can be ` + "`llm_decides`" + ` or ` + "`pattern_match`" + `.
+6.  **Agentic Loop Block (Top-level):**
+    *   Uses ` + "`agentic-loop:`" + ` as a top-level key (like ` + "`parallel-process:`" + `).
+    *   Must contain ` + "`config`" + ` block with loop settings.
+    *   Must contain ` + "`steps`" + ` block with one or more sub-steps.
+    *   Each sub-step follows standard step structure (` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, ` + "`output`" + `).
+7.  **Codebase Index Step:**
+    *   Must have ` + "`step_type: codebase-index`" + ` OR contain a ` + "`codebase_index`" + ` block.
+    *   ` + "`codebase_index.root`" + ` defaults to ` + "`.`" + ` (current directory).
+    *   Exports workflow variables: ` + "`<REPO>_INDEX`" + `, ` + "`<REPO>_INDEX_PATH`" + `, ` + "`<REPO>_INDEX_SHA`" + `, ` + "`<REPO>_INDEX_UPDATED`" + `.
+    *   Does not require ` + "`input`" + `, ` + "`model`" + `, ` + "`action`" + `, or ` + "`output`" + ` fields.
+8.  **qmd Search Step:**
+    *   Must have ` + "`type: qmd-search`" + ` OR contain a ` + "`qmd_search`" + ` block.
+    *   ` + "`qmd_search.query`" + ` is required.
+    *   ` + "`qmd_search.mode`" + ` defaults to ` + "`search`" + ` (BM25).
+    *   Does not require ` + "`input`" + `, ` + "`model`" + `, or ` + "`action`" + ` fields.
 
 ## Chaining and Examples
 
@@ -542,5 +3109,231 @@ final_summary:
 ` + "```" + `
 
 This file-based approach is the correct way to handle any workflow where a step's logic depends on having discrete access to multiple prior outputs.
+
+## 8. Git Worktree Support (Parallel Isolated Execution)
+
+Git worktrees enable running multiple Claude Code sessions in parallel, each with isolated branches and working directories. This is powerful for parallel feature development, multi-task workflows, and avoiding code conflicts between concurrent agents.
+
+**When to use worktrees:**
+- Running multiple Claude Code agents on different tasks simultaneously
+- Parallel feature development (implement auth AND api AND ui at once)
+- A/B testing or comparing different implementations
+- Tasks that would conflict if run in the same directory
+
+### Worktree Configuration
+
+Define worktrees at the top level of your workflow:
+
+` + "```yaml" + `
+worktrees:
+  repo: .                        # Repository path (default: current directory)
+  base_dir: .comanda-worktrees   # Where to create worktrees
+  cleanup: true                  # Auto-cleanup after workflow (default: true)
+  trees:
+    - name: auth                 # Worktree identifier
+      new_branch: true           # Create new branch (worktree-auth)
+    - name: api
+      branch: feature/api        # Use existing branch
+    - name: ui
+      new_branch: true
+      base: develop              # Base branch for new branch
+` + "```" + `
+
+**Worktree Configuration Fields:**
+- ` + "`repo`" + `: (string, default: ` + "`.`" + `) Repository path to use.
+- ` + "`base_dir`" + `: (string, default: ` + "`.comanda-worktrees`" + `) Directory for worktree checkouts.
+- ` + "`cleanup`" + `: (bool, default: true) Remove worktrees after workflow completes.
+- ` + "`trees`" + `: (list) List of worktree specifications.
+
+**Worktree Specification Fields:**
+- ` + "`name`" + `: (string, required) Unique identifier for the worktree.
+- ` + "`new_branch`" + `: (bool) Create a new branch named ` + "`worktree-<name>`" + `.
+- ` + "`branch`" + `: (string) Use an existing branch.
+- ` + "`base`" + `: (string, default: HEAD) Base branch when creating new branch.
+
+### Step-Level Worktree Selection
+
+Use the ` + "`worktree`" + ` field in a step to run it in a specific worktree:
+
+` + "```yaml" + `
+implement_auth:
+  worktree: auth               # Run in 'auth' worktree
+  model: claude-code
+  action: "Implement JWT authentication"
+  output: STDOUT
+
+implement_api:
+  worktree: api                # Run in 'api' worktree
+  model: claude-code
+  action: "Add rate limiting to API endpoints"
+  output: STDOUT
+` + "```" + `
+
+### Variable Expansion
+
+Worktree paths and branches are available as variables:
+- ` + "`${worktrees.auth.path}`" + ` - Absolute path to the auth worktree
+- ` + "`${worktrees.auth.branch}`" + ` - Branch name in the auth worktree
+
+### Example: Parallel Feature Development
+
+` + "```yaml" + `
+worktrees:
+  trees:
+    - name: auth
+      new_branch: true
+    - name: api
+      new_branch: true
+    - name: ui
+      new_branch: true
+
+implement_auth:
+  worktree: auth
+  agentic_loop:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]
+  model: claude-code
+  action: "Implement JWT authentication with refresh tokens. Say DONE when complete."
+  output: STDOUT
+
+implement_api:
+  worktree: api
+  agentic_loop:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]
+  model: claude-code
+  action: "Add rate limiting to all API endpoints. Say DONE when complete."
+  output: STDOUT
+
+implement_ui:
+  worktree: ui
+  agentic_loop:
+    max_iterations: 5
+    exit_condition: llm_decides
+    allowed_paths: [.]
+  model: claude-code
+  action: "Create a login component with form validation. Say DONE when complete."
+  output: STDOUT
+
+qa_review:
+  model: claude-sonnet
+  action: |
+    Review the implementations across all branches:
+    - Auth branch: ${worktrees.auth.path}
+    - API branch: ${worktrees.api.path}
+    - UI branch: ${worktrees.ui.path}
+    
+    Check for consistency, integration issues, and provide a summary.
+  output: ./qa_report.md
+` + "```" + `
+
+### Example: Two Worktrees for Different Tasks
+
+When a user asks to "create two worktrees, one for X and one for Y":
+
+` + "```yaml" + `
+worktrees:
+  trees:
+    - name: task_x
+      new_branch: true
+    - name: task_y
+      new_branch: true
+
+work_on_x:
+  worktree: task_x
+  agentic_loop:
+    max_iterations: 10
+    exit_condition: llm_decides
+    allowed_paths: [.]
+  model: claude-code
+  action: |
+    Work on task X in this isolated worktree.
+    You have full access to modify files without affecting task Y.
+    Say DONE when complete.
+  output: STDOUT
+
+work_on_y:
+  worktree: task_y
+  agentic_loop:
+    max_iterations: 10
+    exit_condition: llm_decides
+    allowed_paths: [.]
+  model: claude-code
+  action: |
+    Work on task Y in this isolated worktree.
+    You have full access to modify files without affecting task X.
+    Say DONE when complete.
+  output: STDOUT
+` + "```" + `
+
+**Provider Support:**
+- ` + "`claude-code`" + `: Native worktree support (uses ` + "`--worktree`" + ` flag when available)
+- Other providers: Worktrees managed by Comanda, passed as working directory
+
+
+## CRITICAL: Workflow Simplicity Guidelines
+
+**ALWAYS prefer the simplest possible workflow.** Over-engineered workflows are harder to debug, maintain, and understand.
+
+**Key principles:**
+1. **Minimize steps**: If a task can be done in 1 step, don't use 3. Most tasks need 1-2 steps.
+2. **Avoid unnecessary chaining**: Don't chain steps unless the output of one is genuinely needed by the next.
+3. **Use direct file I/O**: If you need to read a file and process it, that's ONE step, not three.
+4. **Prefer STDIN/STDOUT**: Use simple STDIN/STDOUT chaining over complex file intermediates when sequential processing suffices.
+5. **One model per workflow when possible**: Don't use multiple models unless comparing outputs or the task genuinely requires different capabilities.
+
+**Examples of OVER-ENGINEERED workflows (AVOID):**
+` + "```yaml" + `
+# BAD: Too many steps for a simple task
+read_file:
+  input: document.txt
+  model: NA
+  action: NA
+  output: temp_content.txt
+
+analyze_content:
+  input: temp_content.txt
+  model: gpt-4o-mini
+  action: "Analyze this"
+  output: temp_analysis.txt
+
+format_output:
+  input: temp_analysis.txt
+  model: gpt-4o-mini
+  action: "Format nicely"
+  output: STDOUT
+` + "```" + `
+
+**GOOD: Simple and direct:**
+` + "```yaml" + `
+# GOOD: One step does the job
+analyze_document:
+  input: document.txt
+  model: gpt-4o-mini
+  action: "Analyze this document and format the output nicely"
+  output: STDOUT
+` + "```" + `
+
+**When multiple steps ARE appropriate:**
+- Processing different source files independently, then combining results
+- Using tool commands to pre-process data before LLM analysis
+- Generating a workflow dynamically, then executing it
+- Tasks that genuinely require different models for different capabilities
+
+**⚠️ DEFAULT TO LINEAR WORKFLOWS. Agentic loops are the rare exception.**
+
+**When to use Agentic Loops (ONLY for genuine iteration):**
+- Code improvement cycles where quality gates determine completion (analyze → fix → verify until tests pass)
+- Tasks where the number of iterations is genuinely unknown and the LLM must decide when done
+- Autonomous retry loops driven by external feedback (e.g., test failures, validator output)
+
+**When NOT to use Agentic Loops — use linear steps instead:**
+- Reading named input files, consulting reference documents, writing to a specified output — this is ALWAYS linear
+- Any "read A, consult B, process C, write output.md" pattern — LINEAR, not agentic
+- Workflows with defined inputs and a specified output format — use linear steps, not loops
+- Document analysis, report generation, financial analysis, data extraction — linear workflows
+- When all steps are known in advance and each executes exactly once — use linear steps
 
 This guide covers the core concepts and syntax of Comanda's YAML DSL, including meta-processing capabilities. LLMs should use this structure to generate valid workflow files.`

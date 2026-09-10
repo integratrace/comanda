@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,14 +16,45 @@ import (
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
-	Short: "Start and manage the HTTP server",
-	Long:  `Start the HTTP server for processing YAML files, or manage server configuration`,
+	Short: "Run the HTTP server for remote workflow execution",
+	Long: `Start the Comanda HTTP server or manage its configuration.
+
+Running 'comanda server' without a subcommand starts the server on the
+configured port (default: 8080).
+
+Endpoints:
+  POST /process                Execute a workflow (multipart form or JSON)
+  GET  /health                 Health check endpoint
+  GET  /graph                  Read a knowledge graph (namespace query parameter)
+  GET  /graph/search           Search graph nodes
+  GET  /graph/subgraph         Fetch a focused graph neighborhood
+
+OpenAI-Compatible Endpoints (when enabled):
+  GET  /v1/models              List available workflows as models
+  POST /v1/chat/completions    Execute workflow via chat completion API`,
+	Example: `  # Start the server
+  comanda server
+
+  # Start with verbose logging
+  comanda server --verbose
+
+  # View current configuration
+  comanda server show
+
+  # Enable OpenAI-compatible API mode
+  comanda server openai-compat on`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Default behavior (no subcommand) is to start the server
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
+		server.SetVersion(getVersion())
 		if err := server.Run(envConfig); err != nil {
-			fmt.Printf("Server failed to start: %v\n", err)
+			log.Printf("Server failed to start: %v\n", err)
 			return
 		}
 	},
@@ -30,102 +62,141 @@ var serverCmd = &cobra.Command{
 
 var configureServerCmd = &cobra.Command{
 	Use:   "configure",
-	Short: "Configure server settings",
-	Long:  `Configure server settings including port, data directory, and authentication`,
+	Short: "Configure server settings interactively",
+	Long: `Interactively configure server settings including:
+  - Port number
+  - Data directory (where workflows are stored)
+  - Bearer token authentication
+  - CORS settings`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for display purposes
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		reader := bufio.NewReader(os.Stdin)
 		if err := configureServer(reader, envConfig); err != nil {
-			fmt.Printf("Error configuring server: %v\n", err)
+			log.Printf("Error configuring server: %v\n", err)
 			return
 		}
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Printf("Server configuration saved successfully to %s!\n", configPath)
+		log.Printf("Server configuration saved successfully to %s!\n", configPath)
 	},
 }
 
 var showServerCmd = &cobra.Command{
 	Use:   "show",
-	Short: "Show current server configuration",
-	Long:  `Display the current server configuration settings`,
+	Short: "Display current server configuration",
+	Long: `Display all server configuration settings including:
+  - Port and data directory
+  - Authentication status and bearer token
+  - CORS configuration
+  - OpenAI compatibility mode status`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		server := envConfig.GetServerConfig()
-		fmt.Println("\nServer Configuration:")
-		fmt.Printf("Port: %d\n", server.Port)
-		fmt.Printf("Data Directory: %s\n", server.DataDir)
-		fmt.Printf("Authentication Enabled: %v\n", server.Enabled)
+		log.Printf("\nServer Configuration:\n")
+		log.Printf("Port: %d\n", server.Port)
+		log.Printf("Data Directory: %s\n", server.DataDir)
+		log.Printf("Authentication Enabled: %v\n", server.Enabled)
 		if server.BearerToken != "" {
-			fmt.Printf("Bearer Token: %s\n", server.BearerToken)
+			log.Printf("Bearer Token: %s\n", server.BearerToken)
 		}
 
 		// Display CORS configuration
-		fmt.Println("\nCORS Configuration:")
-		fmt.Printf("Enabled: %v\n", server.CORS.Enabled)
+		log.Printf("\nCORS Configuration:\n")
+		log.Printf("Enabled: %v\n", server.CORS.Enabled)
 		if server.CORS.Enabled {
-			fmt.Printf("Allowed Origins: %s\n", strings.Join(server.CORS.AllowedOrigins, ", "))
-			fmt.Printf("Allowed Methods: %s\n", strings.Join(server.CORS.AllowedMethods, ", "))
-			fmt.Printf("Allowed Headers: %s\n", strings.Join(server.CORS.AllowedHeaders, ", "))
-			fmt.Printf("Max Age: %d seconds\n", server.CORS.MaxAge)
+			log.Printf("Allowed Origins: %s\n", strings.Join(server.CORS.AllowedOrigins, ", "))
+			log.Printf("Allowed Methods: %s\n", strings.Join(server.CORS.AllowedMethods, ", "))
+			log.Printf("Allowed Headers: %s\n", strings.Join(server.CORS.AllowedHeaders, ", "))
+			log.Printf("Max Age: %d seconds\n", server.CORS.MaxAge)
 		}
-		fmt.Println()
+
+		// Display OpenAI compatibility configuration
+		log.Printf("\nOpenAI Compatibility:\n")
+		log.Printf("Enabled: %v\n", server.OpenAICompat.Enabled)
+		if server.OpenAICompat.Enabled {
+			prefix := server.OpenAICompat.Prefix
+			if prefix == "" {
+				prefix = "/v1"
+			}
+			log.Printf("API Prefix: %s\n", prefix)
+			log.Printf("Endpoints: %s/models, %s/chat/completions\n", prefix, prefix)
+		}
+		log.Printf("\n")
 	},
 }
 
 var updatePortCmd = &cobra.Command{
-	Use:   "port [port]",
-	Short: "Update server port",
-	Long:  `Update the port number that the server listens on`,
-	Args:  cobra.ExactArgs(1),
+	Use:     "port <port-number>",
+	Short:   "Set the server port",
+	Long:    `Set the port number that the server listens on (default: 8080).`,
+	Example: `  comanda server port 3000`,
+	Args:    cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		port, err := strconv.Atoi(args[0])
 		if err != nil {
-			fmt.Printf("Error: Invalid port number: %v\n", err)
+			log.Printf("Error: Invalid port number: %v\n", err)
 			return
 		}
 
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for saving
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		serverConfig := envConfig.GetServerConfig()
 		serverConfig.Port = port
 		envConfig.UpdateServerConfig(*serverConfig)
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Printf("Server port updated to %d\n", port)
+		log.Printf("Server port updated to %d\n", port)
 	},
 }
 
 var updateDataDirCmd = &cobra.Command{
-	Use:   "datadir [path]",
-	Short: "Update data directory",
-	Long:  `Update the directory path where server data is stored`,
-	Args:  cobra.ExactArgs(1),
+	Use:   "datadir <path>",
+	Short: "Set the workflow data directory",
+	Long: `Set the directory where workflow YAML files are stored.
+
+The server looks for workflow files in this directory when processing requests.
+The directory will be created if it doesn't exist.`,
+	Example: `  comanda server datadir /var/comanda/workflows
+  comanda server datadir ./my-workflows`,
+	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		dataDir := args[0]
 
 		// Clean and resolve the path
 		absPath, err := filepath.Abs(dataDir)
 		if err != nil {
-			fmt.Printf("Error: Invalid directory path: %v\n", err)
+			log.Printf("Error: Invalid directory path: %v\n", err)
 			return
 		}
 
 		// Check if path is valid for the OS
 		if !filepath.IsAbs(absPath) {
-			fmt.Printf("Error: Path must be absolute: %s\n", absPath)
+			log.Printf("Error: Path must be absolute: %s\n", absPath)
 			return
 		}
 
@@ -133,57 +204,74 @@ var updateDataDirCmd = &cobra.Command{
 		parentDir := filepath.Dir(absPath)
 		if _, err := os.Stat(parentDir); err != nil {
 			if os.IsNotExist(err) {
-				fmt.Printf("Error: Parent directory does not exist: %s\n", parentDir)
+				log.Printf("Error: Parent directory does not exist: %s\n", parentDir)
 			} else {
-				fmt.Printf("Error: Cannot access parent directory: %v\n", err)
+				log.Printf("Error: Cannot access parent directory: %v\n", err)
 			}
 			return
 		}
 
 		// Try to create the directory to verify write permissions
 		if err := os.MkdirAll(absPath, 0755); err != nil {
-			fmt.Printf("Error: Cannot create directory (check permissions): %v\n", err)
+			log.Printf("Error: Cannot create directory (check permissions): %v\n", err)
 			return
 		}
 
 		// Verify the directory is writable by creating a test file
 		testFile := filepath.Join(absPath, ".write_test")
 		if err := os.WriteFile(testFile, []byte(""), 0644); err != nil {
-			fmt.Printf("Error: Directory is not writable: %v\n", err)
+			log.Printf("Error: Directory is not writable: %v\n", err)
 			return
 		}
 		os.Remove(testFile) // Clean up test file
 
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for saving
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		serverConfig := envConfig.GetServerConfig()
 		serverConfig.DataDir = absPath
 		envConfig.UpdateServerConfig(*serverConfig)
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Printf("Data directory updated to %s\n", absPath)
+		log.Printf("Data directory updated to %s\n", absPath)
 	},
 }
 
 var toggleAuthCmd = &cobra.Command{
-	Use:   "auth [on|off]",
-	Short: "Toggle authentication",
-	Long:  `Enable or disable server authentication`,
-	Args:  cobra.ExactArgs(1),
+	Use:   "auth <on|off>",
+	Short: "Enable or disable bearer token authentication",
+	Long: `Enable or disable bearer token authentication for the HTTP server.
+
+When enabled, all requests must include the header:
+  Authorization: Bearer <token>
+
+A token is automatically generated when auth is first enabled.
+Use 'comanda server newtoken' to generate a new token.
+Use 'comanda server show' to view the current token.`,
+	Example: `  comanda server auth on
+  comanda server auth off`,
+	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		enable := strings.ToLower(args[0])
 		if enable != "on" && enable != "off" {
-			fmt.Println("Error: Please specify either 'on' or 'off'")
+			log.Printf("Error: Please specify either 'on' or 'off'\n")
 			return
 		}
 
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for saving
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		serverConfig := envConfig.GetServerConfig()
 		serverConfig.Enabled = enable == "on"
@@ -192,36 +280,43 @@ var toggleAuthCmd = &cobra.Command{
 		if serverConfig.Enabled && serverConfig.BearerToken == "" {
 			token, err := config.GenerateBearerToken()
 			if err != nil {
-				fmt.Printf("Error generating bearer token: %v\n", err)
+				log.Printf("Error generating bearer token: %v\n", err)
 				return
 			}
 			serverConfig.BearerToken = token
-			fmt.Printf("Generated new bearer token: %s\n", token)
+			log.Printf("Generated new bearer token: %s\n", token)
 		}
 
 		envConfig.UpdateServerConfig(*serverConfig)
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Printf("Server authentication %s\n", map[bool]string{true: "enabled", false: "disabled"}[serverConfig.Enabled])
+		log.Printf("Server authentication %s\n", map[bool]string{true: "enabled", false: "disabled"}[serverConfig.Enabled])
 	},
 }
 
 var newTokenCmd = &cobra.Command{
 	Use:   "newtoken",
-	Short: "Generate new bearer token",
-	Long:  `Generate a new bearer token for server authentication`,
+	Short: "Generate a new bearer token",
+	Long: `Generate a new bearer token for server authentication.
+
+This replaces any existing token. The new token is displayed and saved
+to the configuration file.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for saving
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		serverConfig := envConfig.GetServerConfig()
 		token, err := config.GenerateBearerToken()
 		if err != nil {
-			fmt.Printf("Error generating bearer token: %v\n", err)
+			log.Printf("Error generating bearer token: %v\n", err)
 			return
 		}
 
@@ -229,11 +324,11 @@ var newTokenCmd = &cobra.Command{
 		envConfig.UpdateServerConfig(*serverConfig)
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Printf("Generated new bearer token: %s\n", token)
+		log.Printf("Generated new bearer token: %s\n", token)
 	},
 }
 
@@ -242,7 +337,7 @@ func configureServer(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 	serverConfig := envConfig.GetServerConfig()
 
 	// Prompt for port
-	fmt.Printf("Enter server port (default: %d): ", serverConfig.Port)
+	log.Printf("Enter server port (default: %d): ", serverConfig.Port)
 	portStr, _ := reader.ReadString('\n')
 	portStr = strings.TrimSpace(portStr)
 	if portStr != "" {
@@ -254,7 +349,7 @@ func configureServer(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 	}
 
 	// Prompt for data directory
-	fmt.Printf("Enter data directory path (default: %s): ", serverConfig.DataDir)
+	log.Printf("Enter data directory path (default: %s): ", serverConfig.DataDir)
 	dataDir, _ := reader.ReadString('\n')
 	dataDir = strings.TrimSpace(dataDir)
 	if dataDir != "" {
@@ -267,7 +362,7 @@ func configureServer(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 	}
 
 	// Prompt for bearer token generation
-	fmt.Print("Generate new bearer token? (y/n): ")
+	log.Printf("Generate new bearer token? (y/n): ")
 	genToken, _ := reader.ReadString('\n')
 	if strings.TrimSpace(strings.ToLower(genToken)) == "y" {
 		token, err := config.GenerateBearerToken()
@@ -275,11 +370,11 @@ func configureServer(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 			return fmt.Errorf("error generating bearer token: %v", err)
 		}
 		serverConfig.BearerToken = token
-		fmt.Printf("Generated bearer token: %s\n", token)
+		log.Printf("Generated bearer token: %s\n", token)
 	}
 
 	// Prompt for server enable/disable
-	fmt.Print("Enable server authentication? (y/n): ")
+	log.Printf("Enable server authentication? (y/n): ")
 	enableStr, _ := reader.ReadString('\n')
 	serverConfig.Enabled = strings.TrimSpace(strings.ToLower(enableStr)) == "y"
 
@@ -294,24 +389,38 @@ func configureServer(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 
 var corsCmd = &cobra.Command{
 	Use:   "cors",
-	Short: "Configure CORS settings",
-	Long:  `Configure Cross-Origin Resource Sharing (CORS) settings for the server`,
+	Short: "Configure CORS settings interactively",
+	Long: `Configure Cross-Origin Resource Sharing (CORS) settings for the server.
+
+CORS controls which web domains can make requests to the server from browsers.
+This is required when integrating Comanda with web applications.
+
+The interactive prompts will ask for:
+  - Enable/disable CORS
+  - Allowed origins (domains that can access the API)
+  - Allowed HTTP methods
+  - Allowed headers
+  - Max age (how long browsers cache CORS preflight responses)`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Use the centralized configuration that was loaded in rootCmd's PersistentPreRunE
-		configPath := config.GetEnvPath() // Only needed for saving
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
 
 		reader := bufio.NewReader(os.Stdin)
 		if err := configureCORS(reader, envConfig); err != nil {
-			fmt.Printf("Error configuring CORS: %v\n", err)
+			log.Printf("Error configuring CORS: %v\n", err)
 			return
 		}
 
 		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
+			log.Printf("Error saving configuration: %v\n", err)
 			return
 		}
 
-		fmt.Println("CORS configuration saved successfully!")
+		log.Printf("CORS configuration saved successfully!\n")
 	},
 }
 
@@ -320,13 +429,13 @@ func configureCORS(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 	serverConfig := envConfig.GetServerConfig()
 
 	// Prompt for CORS enable/disable
-	fmt.Print("Enable CORS? (y/n): ")
+	log.Printf("Enable CORS? (y/n): ")
 	enableStr, _ := reader.ReadString('\n')
 	serverConfig.CORS.Enabled = strings.TrimSpace(strings.ToLower(enableStr)) == "y"
 
 	if serverConfig.CORS.Enabled {
 		// Prompt for allowed origins
-		fmt.Print("Enter allowed origins (comma-separated, * for all, default: *): ")
+		log.Printf("Enter allowed origins (comma-separated, * for all, default: *): ")
 		originsStr, _ := reader.ReadString('\n')
 		originsStr = strings.TrimSpace(originsStr)
 		if originsStr != "" && originsStr != "*" {
@@ -339,7 +448,7 @@ func configureCORS(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 		}
 
 		// Prompt for allowed methods
-		fmt.Print("Enter allowed methods (comma-separated, default: GET,POST,PUT,DELETE,OPTIONS): ")
+		log.Printf("Enter allowed methods (comma-separated, default: GET,POST,PUT,DELETE,OPTIONS): ")
 		methodsStr, _ := reader.ReadString('\n')
 		methodsStr = strings.TrimSpace(methodsStr)
 		if methodsStr != "" {
@@ -352,7 +461,7 @@ func configureCORS(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 		}
 
 		// Prompt for allowed headers
-		fmt.Print("Enter allowed headers (comma-separated, default: Authorization,Content-Type): ")
+		log.Printf("Enter allowed headers (comma-separated, default: Authorization,Content-Type): ")
 		headersStr, _ := reader.ReadString('\n')
 		headersStr = strings.TrimSpace(headersStr)
 		if headersStr != "" {
@@ -373,7 +482,7 @@ func configureCORS(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 		}
 
 		// Prompt for max age
-		fmt.Print("Enter max age in seconds (default: 3600): ")
+		log.Printf("Enter max age in seconds (default: 3600): ")
 		maxAgeStr, _ := reader.ReadString('\n')
 		maxAgeStr = strings.TrimSpace(maxAgeStr)
 		if maxAgeStr != "" {
@@ -391,6 +500,57 @@ func configureCORS(reader *bufio.Reader, envConfig *config.EnvConfig) error {
 	return nil
 }
 
+var openaiCompatCmd = &cobra.Command{
+	Use:   "openai-compat <on|off>",
+	Short: "Enable or disable OpenAI-compatible API endpoints",
+	Long: `Enable or disable OpenAI-compatible API endpoints (/v1/models, /v1/chat/completions).
+
+When enabled, tools like Cline can connect to Comanda using the OpenAI API format.
+Workflows are exposed as models, and chat completions execute the specified workflow.
+
+Example configuration for Cline:
+  API Provider: OpenAI Compatible
+  Base URL: http://localhost:8080/v1
+  API Key: <your-comanda-bearer-token>
+  Model: <workflow-name>`,
+	Args: cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		enable := strings.ToLower(args[0])
+		if enable != "on" && enable != "off" {
+			log.Printf("Error: Please specify either 'on' or 'off'\n")
+			return
+		}
+
+		configPath := config.GetEnvPath()
+		envConfig, err := config.LoadEnvConfigWithPassword(configPath)
+		if err != nil {
+			log.Printf("Error loading configuration: %v\n", err)
+			return
+		}
+
+		serverConfig := envConfig.GetServerConfig()
+		serverConfig.OpenAICompat.Enabled = enable == "on"
+
+		// Set default prefix if not set
+		if serverConfig.OpenAICompat.Prefix == "" {
+			serverConfig.OpenAICompat.Prefix = "/v1"
+		}
+
+		envConfig.UpdateServerConfig(*serverConfig)
+
+		if err := config.SaveEnvConfig(configPath, envConfig); err != nil {
+			log.Printf("Error saving configuration: %v\n", err)
+			return
+		}
+
+		if serverConfig.OpenAICompat.Enabled {
+			log.Printf("OpenAI compatibility mode enabled at %s\n", serverConfig.OpenAICompat.Prefix)
+		} else {
+			log.Printf("OpenAI compatibility mode disabled\n")
+		}
+	},
+}
+
 func init() {
 	serverCmd.AddCommand(configureServerCmd)
 	serverCmd.AddCommand(showServerCmd)
@@ -399,5 +559,6 @@ func init() {
 	serverCmd.AddCommand(toggleAuthCmd)
 	serverCmd.AddCommand(newTokenCmd)
 	serverCmd.AddCommand(corsCmd)
+	serverCmd.AddCommand(openaiCompatCmd)
 	rootCmd.AddCommand(serverCmd)
 }

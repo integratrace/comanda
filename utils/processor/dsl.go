@@ -4,12 +4,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/kris-hansen/comanda/utils/chunker"
+	"github.com/kris-hansen/comanda/utils/codebaseindex"
 	"github.com/kris-hansen/comanda/utils/config"
 	"github.com/kris-hansen/comanda/utils/input"
 	"github.com/kris-hansen/comanda/utils/models"
@@ -33,18 +38,105 @@ type ProcessStepConfig struct {
 
 // Processor handles the DSL processing pipeline
 type Processor struct {
-	config       *DSLConfig
-	envConfig    *config.EnvConfig
-	serverConfig *config.ServerConfig // Add server config
-	handler      *input.Handler
-	validator    *input.Validator
-	providers    map[string]models.Provider
-	verbose      bool
-	lastOutput   string
-	spinner      *Spinner
-	variables    map[string]string // Store variables from STDIN
-	progress     ProgressWriter    // Progress writer for streaming updates
-	runtimeDir   string            // Runtime directory for file operations
+	config               *DSLConfig
+	envConfig            *config.EnvConfig
+	serverConfig         *config.ServerConfig // Add server config
+	handler              *input.Handler
+	validator            *input.Validator
+	providers            map[string]models.Provider
+	verbose              bool
+	lastOutput           string
+	spinner              *Spinner
+	variables            map[string]string  // Store variables from STDIN
+	cliVariables         map[string]string  // CLI-provided variables for {{var}} substitution
+	progress             ProgressWriter     // Progress writer for streaming updates
+	progressDisplay      *ProgressDisplay   // Visual progress display for terminal output
+	runtimeDir           string             // Runtime directory for file operations
+	sourceRoot           string             // Stable project root for source inputs and context
+	memory               *MemoryManager     // Memory manager for COMANDA.md file
+	externalMemory       string             // External memory context (e.g., from OpenAI messages)
+	mu                   sync.Mutex         // Mutex for thread-safe debug logging
+	currentAgenticConfig *AgenticLoopConfig // Current agentic loop config (set during agentic loop execution)
+	streamLog            *StreamLogger      // Stream logger for real-time monitoring of long operations
+	streamLogPath        string             // Path to stream log file (for passing to sub-processes)
+	worktreeHandler      *WorktreeHandler   // Handler for Git worktrees (parallel Claude Code execution)
+	currentStepWorktree  string             // Current step's worktree name (if any)
+	workflowFile         string             // Workflow file that created this processor, for loop state/checksums
+	preConfiguredNames   map[string]bool    // Provider names injected via SetProvider; skip envConfig-based setup
+}
+
+// SetSourceRoot binds this processor to a stable project source tree. Runtime
+// outputs remain in runtimeDir; only source-oriented lookups fall back here.
+func (p *Processor) SetSourceRoot(root string) {
+	p.sourceRoot = root
+	if root != "" {
+		p.debugf("Processor initialized with project source root: %s", root)
+	}
+}
+
+// SourceRoot returns the stable project source tree, when one was selected.
+func (p *Processor) SourceRoot() string { return p.sourceRoot }
+
+// getEffectiveWorkDir returns the working directory for commands and agentic
+// tools. A selected project is the stable workspace for a Canvas run; the
+// runtime directory is only the server-private location for uploaded workflow
+// files and transient output. Worktrees take precedence over the project.
+func (p *Processor) getEffectiveWorkDir() string {
+	if p.currentStepWorktree != "" && p.worktreeHandler != nil {
+		if path, err := p.worktreeHandler.GetWorktreePath(p.currentStepWorktree); err == nil {
+			p.debugf("Using worktree path for step: %s -> %s", p.currentStepWorktree, path)
+			return path
+		}
+	}
+	if p.sourceRoot != "" {
+		return p.sourceRoot
+	}
+	if p.serverConfig != nil && p.serverConfig.Enabled && p.runtimeDir != "" {
+		return filepath.Join(p.serverConfig.DataDir, p.runtimeDir)
+	}
+	return p.runtimeDir
+}
+
+// setCurrentStepWorktree sets the worktree context for the current step
+func (p *Processor) setCurrentStepWorktree(worktreeName string) {
+	p.currentStepWorktree = worktreeName
+}
+
+// clearCurrentStepWorktree clears the worktree context
+func (p *Processor) clearCurrentStepWorktree() {
+	p.currentStepWorktree = ""
+}
+
+// getCurrentStepWorktree returns the worktree name for the current step
+func (p *Processor) getCurrentStepWorktree() string {
+	return p.currentStepWorktree
+}
+
+// providerSupportsWorktrees checks if a provider has native worktree support
+func (p *Processor) providerSupportsWorktrees(providerName string) bool {
+	if p.envConfig == nil {
+		return false
+	}
+	provider, err := p.envConfig.GetProviderConfig(providerName)
+	if err != nil || provider == nil {
+		// Default to true for claude-code (native support)
+		return providerName == "claude-code"
+	}
+	return provider.SupportsWorktrees
+}
+
+// setAgenticConfig sets the current agentic config (thread-safe)
+func (p *Processor) setAgenticConfig(config *AgenticLoopConfig) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.currentAgenticConfig = config
+}
+
+// getAgenticConfig returns the current agentic config (thread-safe)
+func (p *Processor) getAgenticConfig() *AgenticLoopConfig {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.currentAgenticConfig
 }
 
 // UnmarshalYAML is a custom unmarshaler for DSLConfig to handle mixed types at the root level
@@ -56,6 +148,9 @@ func (c *DSLConfig) UnmarshalYAML(node *yaml.Node) error {
 	c.Steps = []Step{}
 	c.ParallelSteps = make(map[string][]Step)
 	c.Defer = make(map[string]StepConfig)
+	c.AgenticLoops = make(map[string]*AgenticLoopConfig)
+	c.Loops = make(map[string]*AgenticLoopConfig)
+	c.Workflow = make(map[string]*WorkflowNode)
 
 	for i := 0; i < len(node.Content); i += 2 {
 		keyNode := node.Content[i]
@@ -84,11 +179,37 @@ func (c *DSLConfig) UnmarshalYAML(node *yaml.Node) error {
 
 			// Assign deferred steps to the config
 			c.Defer = deferredSteps
+		case "agentic-loop":
+			// Parse agentic loop block with config and steps
+			if err := c.parseAgenticLoopBlock(valueNode); err != nil {
+				return fmt.Errorf("failed to decode agentic loop: %w", err)
+			}
+		case "loops":
+			// Parse named loops for orchestration
+			var loops map[string]*AgenticLoopConfig
+			if err := valueNode.Decode(&loops); err != nil {
+				return fmt.Errorf("failed to decode loops: %w", err)
+			}
+			c.Loops = loops
+		case "execute_loops":
+			// Parse simple execution order
+			var executeLoops []string
+			if err := valueNode.Decode(&executeLoops); err != nil {
+				return fmt.Errorf("failed to decode execute_loops: %w", err)
+			}
+			c.ExecuteLoops = executeLoops
+		case "workflow":
+			// Parse workflow nodes
+			var workflow map[string]*WorkflowNode
+			if err := valueNode.Decode(&workflow); err != nil {
+				return fmt.Errorf("failed to decode workflow: %w", err)
+			}
+			c.Workflow = workflow
 		default:
 			// Try to decode as a standard step config first
 			var stepConfig StepConfig
 			stepErr := valueNode.Decode(&stepConfig)
-			
+
 			// If it fails or if the valueNode is a mapping that contains nested steps,
 			// check if this is a parallel step group
 			if stepErr != nil || c.isParallelStepGroup(valueNode) {
@@ -100,11 +221,18 @@ func (c *DSLConfig) UnmarshalYAML(node *yaml.Node) error {
 					}
 					return fmt.Errorf("failed to decode parallel step group '%s': %w", stepName, err)
 				}
-				
-				// Convert map[string]StepConfig to []Step
+
+				// Convert map[string]StepConfig to []Step with deterministic ordering
+				// Sort keys to ensure consistent behavior across runs
+				keys := make([]string, 0, len(parallelSteps))
+				for k := range parallelSteps {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+
 				var steps []Step
-				for subStepName, subStepConfig := range parallelSteps {
-					steps = append(steps, Step{Name: subStepName, Config: subStepConfig})
+				for _, subStepName := range keys {
+					steps = append(steps, Step{Name: subStepName, Config: parallelSteps[subStepName]})
 				}
 				c.ParallelSteps[stepName] = steps
 			} else {
@@ -123,7 +251,7 @@ func (c *DSLConfig) isParallelStepGroup(node *yaml.Node) bool {
 	if node.Kind != yaml.MappingNode {
 		return false
 	}
-	
+
 	// Check if all the values in this mapping are themselves mappings
 	// which would indicate nested step configurations
 	for i := 1; i < len(node.Content); i += 2 {
@@ -131,14 +259,14 @@ func (c *DSLConfig) isParallelStepGroup(node *yaml.Node) bool {
 		if valueNode.Kind != yaml.MappingNode {
 			return false
 		}
-		
+
 		// Check if this nested mapping has step-like keys
 		hasStepKeys := false
 		for j := 0; j < len(valueNode.Content); j += 2 {
 			keyNode := valueNode.Content[j]
 			key := keyNode.Value
-			if key == "input" || key == "model" || key == "action" || key == "output" || 
-			   key == "generate" || key == "process" || key == "type" {
+			if key == "input" || key == "model" || key == "action" || key == "output" ||
+				key == "generate" || key == "process" || key == "type" || key == "agentic_loop" {
 				hasStepKeys = true
 				break
 			}
@@ -147,8 +275,79 @@ func (c *DSLConfig) isParallelStepGroup(node *yaml.Node) bool {
 			return false
 		}
 	}
-	
+
 	return true
+}
+
+// parseAgenticLoopBlock parses an agentic-loop block from YAML
+// The block can have a "config" section with loop settings and a "steps" section with sub-steps
+func (c *DSLConfig) parseAgenticLoopBlock(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("agentic-loop must be a mapping")
+	}
+
+	// Parse the agentic loop structure
+	loopConfig := &AgenticLoopConfig{}
+	var stepsNode *yaml.Node
+
+	for i := 0; i < len(node.Content); i += 2 {
+		keyNode := node.Content[i]
+		valueNode := node.Content[i+1]
+		key := keyNode.Value
+
+		switch key {
+		case "config":
+			// Decode the config section
+			if err := valueNode.Decode(loopConfig); err != nil {
+				return fmt.Errorf("failed to decode agentic loop config: %w", err)
+			}
+		case "steps":
+			stepsNode = valueNode
+		default:
+			return fmt.Errorf("unknown key '%s' in agentic-loop block, expected 'config' or 'steps'", key)
+		}
+	}
+
+	// Parse steps if present
+	if stepsNode != nil {
+		switch stepsNode.Kind {
+		case yaml.MappingNode:
+			for i := 0; i < len(stepsNode.Content); i += 2 {
+				keyNode := stepsNode.Content[i]
+				valueNode := stepsNode.Content[i+1]
+				stepName := keyNode.Value
+
+				var stepConfig StepConfig
+				if err := valueNode.Decode(&stepConfig); err != nil {
+					return fmt.Errorf("failed to decode agentic loop step '%s': %w", stepName, err)
+				}
+
+				loopConfig.Steps = append(loopConfig.Steps, Step{Name: stepName, Config: stepConfig})
+			}
+		case yaml.SequenceNode:
+			for _, item := range stepsNode.Content {
+				if item.Kind != yaml.MappingNode || len(item.Content) != 2 {
+					return fmt.Errorf("agentic-loop list steps must be single-entry mappings")
+				}
+
+				stepName := item.Content[0].Value
+				valueNode := item.Content[1]
+
+				var stepConfig StepConfig
+				if err := valueNode.Decode(&stepConfig); err != nil {
+					return fmt.Errorf("failed to decode agentic loop step '%s': %w", stepName, err)
+				}
+
+				loopConfig.Steps = append(loopConfig.Steps, Step{Name: stepName, Config: stepConfig})
+			}
+		default:
+			return fmt.Errorf("agentic-loop steps must be a mapping or sequence")
+		}
+	}
+
+	// Store the loop config with a default name
+	c.AgenticLoops["agentic-loop"] = loopConfig
+	return nil
 }
 
 // isTestMode checks if the code is running in test mode
@@ -157,29 +356,31 @@ func isTestMode() bool {
 }
 
 // NewProcessor creates a new DSL processor
-func NewProcessor(config *DSLConfig, envConfig *config.EnvConfig, serverConfig *config.ServerConfig, verbose bool, runtimeDir ...string) *Processor {
-	// Default runtime directory to empty string if not provided
-	rd := ""
-	if len(runtimeDir) > 0 {
-		rd = runtimeDir[0]
+func NewProcessor(dslConfig *DSLConfig, envConfig *config.EnvConfig, serverConfig *config.ServerConfig, verbose bool, runtimeDir string, cliVariables ...map[string]string) *Processor {
+	// Get CLI variables if provided
+	cliVars := make(map[string]string)
+	if len(cliVariables) > 0 && cliVariables[0] != nil {
+		cliVars = cliVariables[0]
 	}
 
 	p := &Processor{
-		config:       config,
-		envConfig:    envConfig,
-		serverConfig: serverConfig, // Store server config
-		handler:      input.NewHandler(),
-		validator:    input.NewValidator(nil),
-		providers:    make(map[string]models.Provider),
-		verbose:      verbose,
-		spinner:      NewSpinner(),
-		variables:    make(map[string]string),
-		runtimeDir:   rd, // Store runtime directory
+		config:          dslConfig,
+		envConfig:       envConfig,
+		serverConfig:    serverConfig, // Store server config
+		handler:         input.NewHandler(),
+		validator:       input.NewValidator(nil),
+		providers:       make(map[string]models.Provider),
+		verbose:         verbose,
+		spinner:         NewSpinner(),
+		progressDisplay: NewProgressDisplay(true), // Enable visual progress
+		variables:       make(map[string]string),
+		cliVariables:    cliVars,
+		runtimeDir:      runtimeDir, // Store runtime directory
 	}
 
 	// Store runtime directory as-is (relative or empty)
-	if rd != "" {
-		p.debugf("Processor initialized with runtime directory: %s", rd)
+	if runtimeDir != "" {
+		p.debugf("Processor initialized with runtime directory: %s", runtimeDir)
 	} else {
 		p.debugf("Processor initialized without a specific runtime directory.")
 	}
@@ -191,6 +392,51 @@ func NewProcessor(config *DSLConfig, envConfig *config.EnvConfig, serverConfig *
 		p.debugf("- DataDir: %s", p.serverConfig.DataDir)
 	} else {
 		p.debugf("No server configuration provided")
+	}
+
+	// Initialize memory manager
+	memoryPath := config.GetMemoryPath(envConfig)
+	if memoryPath != "" {
+		memoryMgr, err := NewMemoryManager(memoryPath)
+		if err != nil {
+			// Provide detailed diagnostic information about the failure
+			p.debugf("Warning: Failed to initialize memory manager")
+			p.debugf("  Memory file path: %s", memoryPath)
+			p.debugf("  Error: %v", err)
+
+			// Check if file exists and provide additional context
+			if fileInfo, statErr := os.Stat(memoryPath); statErr != nil {
+				if os.IsNotExist(statErr) {
+					p.debugf("  Reason: Memory file does not exist")
+				} else if os.IsPermission(statErr) {
+					p.debugf("  Reason: Permission denied accessing memory file")
+				} else {
+					p.debugf("  Additional error: %v", statErr)
+				}
+			} else {
+				p.debugf("  File exists: true, Size: %d bytes", fileInfo.Size())
+				if !fileInfo.Mode().IsRegular() {
+					p.debugf("  Reason: Path is not a regular file")
+				}
+			}
+			p.debugf("  Memory features will be disabled for this session")
+		} else {
+			p.memory = memoryMgr
+			p.debugf("Memory manager initialized with file: %s", memoryPath)
+		}
+	} else {
+		p.debugf("No memory file configured")
+	}
+
+	// Initialize worktree handler if worktrees are configured
+	if dslConfig.Worktrees != nil && len(dslConfig.Worktrees.Trees) > 0 {
+		wtHandler, err := NewWorktreeHandler(dslConfig.Worktrees, runtimeDir, verbose)
+		if err != nil {
+			p.debugf("Warning: Failed to initialize worktree handler: %v", err)
+		} else {
+			p.worktreeHandler = wtHandler
+			p.debugf("Worktree handler initialized with %d worktrees", len(dslConfig.Worktrees.Trees))
+		}
 	}
 
 	// Disable spinner in test environments
@@ -208,6 +454,63 @@ func (p *Processor) SetProgressWriter(w ProgressWriter) {
 	p.spinner.SetProgressWriter(w)
 }
 
+// SetWorkflowFile records the workflow file used to create this processor.
+// It is intentionally separate from runtimeDir: CLI file paths are resolved
+// relative to the user's cwd unless --runtime-dir is explicitly provided.
+func (p *Processor) SetWorkflowFile(path string) {
+	p.workflowFile = path
+}
+
+// DisableSpinner disables the CLI spinner (use when running in TUI mode)
+func (p *Processor) DisableSpinner() {
+	p.spinner.Disable()
+}
+
+// DisableProgressDisplay disables the progress display output (use when running in TUI mode)
+func (p *Processor) DisableProgressDisplay() {
+	p.progressDisplay.SetEnabled(false)
+}
+
+// SetStreamLog sets up stream logging to a file for real-time monitoring
+func (p *Processor) SetStreamLog(path string) error {
+	if path == "" {
+		return nil
+	}
+	logger, err := NewStreamLogger(path)
+	if err != nil {
+		return err
+	}
+	p.streamLog = logger
+	p.streamLogPath = path
+	p.debugf("Stream logging enabled: %s", path)
+	return nil
+}
+
+// SetStreamLogCallback routes stream log lines (loop iterations, context usage,
+// tool activity, exit conditions) to a callback instead of requiring a file.
+// Lines use the same format as the file-based stream log. If a file-based
+// stream log is already configured, the callback receives a copy of each line.
+func (p *Processor) SetStreamLogCallback(cb func(line string)) {
+	if p.streamLog != nil {
+		p.streamLog.SetCallback(cb)
+		return
+	}
+	p.streamLog = NewCallbackStreamLogger(cb)
+	p.debugf("Stream log callback enabled")
+}
+
+// GetStreamLogPath returns the path to the stream log file
+func (p *Processor) GetStreamLogPath() string {
+	return p.streamLogPath
+}
+
+// CloseStreamLog closes the stream log file
+func (p *Processor) CloseStreamLog() {
+	if p.streamLog != nil {
+		p.streamLog.Close()
+	}
+}
+
 // SetLastOutput sets the last output value, useful for initializing with STDIN data
 func (p *Processor) SetLastOutput(output string) {
 	p.lastOutput = output
@@ -218,10 +521,43 @@ func (p *Processor) LastOutput() string {
 	return p.lastOutput
 }
 
-// debugf prints debug information if verbose mode is enabled
+// SetMemoryContext sets external memory context (e.g., from OpenAI chat messages)
+// This context is used alongside or instead of file-based memory
+func (p *Processor) SetMemoryContext(context string) {
+	p.externalMemory = context
+}
+
+// GetMemoryFilePath returns the path to the memory file, or empty string if not configured
+func (p *Processor) GetMemoryFilePath() string {
+	if p.memory == nil {
+		return ""
+	}
+	return p.memory.GetFilePath()
+}
+
+// getGlobalToolConfig returns the global tool configuration from envConfig, converted to processor.ToolConfig
+func (p *Processor) getGlobalToolConfig() *ToolConfig {
+	if p.envConfig == nil {
+		return nil
+	}
+	globalConfig := p.envConfig.GetToolConfig()
+	if globalConfig == nil {
+		return nil
+	}
+	// Convert from config.ToolConfig to processor.ToolConfig
+	return &ToolConfig{
+		Allowlist: globalConfig.Allowlist,
+		Denylist:  globalConfig.Denylist,
+		Timeout:   globalConfig.Timeout,
+	}
+}
+
+// debugf prints debug information if verbose mode is enabled (thread-safe)
 func (p *Processor) debugf(format string, args ...interface{}) {
 	if p.verbose {
-		fmt.Printf("[DEBUG][DSL] "+format+"\n", args...)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		log.Printf("[DEBUG][DSL] "+format+"\n", args...)
 	}
 }
 
@@ -299,7 +635,117 @@ func (p *Processor) substituteVariables(text string) string {
 	for name, value := range p.variables {
 		text = strings.ReplaceAll(text, "$"+name, value)
 	}
+	// Also expand worktree variables (${worktrees.name.path}, etc.)
+	if p.worktreeHandler != nil {
+		text = p.worktreeHandler.ExpandWorktreeVariables(text)
+	}
+	// Expand index references: ${INDEX:name} -> load from registry
+	text = p.expandIndexReferences(text)
 	return text
+}
+
+// expandIndexReferences expands ${INDEX:name} references by loading from registry
+func (p *Processor) expandIndexReferences(text string) string {
+	// Match ${INDEX:name} pattern
+	re := regexp.MustCompile(`\$\{INDEX:([a-zA-Z0-9_-]+)\}`)
+
+	return re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract index name
+		matches := re.FindStringSubmatch(match)
+		if len(matches) < 2 {
+			return match
+		}
+		indexName := matches[1]
+
+		// Check if already loaded as a variable
+		varName := strings.ToUpper(indexName) + "_INDEX"
+		if content, ok := p.variables[varName]; ok {
+			return content
+		}
+
+		// Try to load from registry
+		if p.envConfig == nil || p.envConfig.Indexes == nil {
+			p.debugf("Warning: ${INDEX:%s} - no registry available", indexName)
+			return match
+		}
+
+		entry, ok := p.envConfig.Indexes[indexName]
+		if !ok {
+			p.debugf("Warning: ${INDEX:%s} - index not found in registry", indexName)
+			return match
+		}
+
+		// Load index content
+		content, err := os.ReadFile(entry.IndexPath)
+		if err != nil {
+			p.debugf("Warning: ${INDEX:%s} - failed to read: %v", indexName, err)
+			return match
+		}
+
+		// Handle encrypted indexes
+		if entry.Encrypted {
+			key := os.Getenv("COMANDA_INDEX_KEY")
+			if key == "" && p.envConfig != nil {
+				key = p.envConfig.IndexEncryptionKey
+			}
+			if key == "" {
+				p.debugf("Warning: ${INDEX:%s} - encrypted but no key", indexName)
+				return match
+			}
+			decrypted, err := codebaseindex.Decrypt(content, key)
+			if err != nil {
+				p.debugf("Warning: ${INDEX:%s} - decryption failed: %v", indexName, err)
+				return match
+			}
+			content = decrypted
+		}
+
+		// Cache in variables for future use
+		p.variables[varName] = string(content)
+		p.variables[strings.ToUpper(indexName)+"_INDEX_PATH"] = entry.IndexPath
+
+		p.debugf("Loaded index '%s' via ${INDEX:%s} reference", indexName, indexName)
+		return string(content)
+	})
+}
+
+// SubstituteCLIVariables replaces {{varname}} with CLI-provided values
+// Uses regex single-pass replacement to prevent cross-variable injection
+// (i.e., if a variable's value contains {{...}}, it won't be re-substituted)
+func (p *Processor) SubstituteCLIVariables(text string) string {
+	if len(p.cliVariables) == 0 {
+		return text
+	}
+
+	// Match {{ varname }} or {{varname}} patterns
+	pattern := regexp.MustCompile(`\{\{\s*([^}]+?)\s*\}\}`)
+
+	return pattern.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract variable name (strip braces and whitespace)
+		inner := strings.TrimPrefix(match, "{{")
+		inner = strings.TrimSuffix(inner, "}}")
+		varName := strings.TrimSpace(inner)
+
+		if value, ok := p.cliVariables[varName]; ok {
+			return value
+		}
+		// Leave unrecognized patterns unchanged
+		return match
+	})
+}
+
+// substituteCLIVariablesInSlice applies CLI variable substitution to all elements in a slice
+func (p *Processor) substituteCLIVariablesInSlice(items []string) {
+	for i, item := range items {
+		items[i] = p.SubstituteCLIVariables(item)
+	}
+}
+
+// substituteVariablesInSlice applies step output variable substitution ($VARNAME) to all elements in a slice
+func (p *Processor) substituteVariablesInSlice(items []string) {
+	for i, item := range items {
+		items[i] = p.substituteVariables(item)
+	}
 }
 
 // validateStepConfig checks if all required fields are present in a step
@@ -308,7 +754,9 @@ func (p *Processor) validateStepConfig(stepName string, config StepConfig) error
 
 	isGenerateStep := config.Generate != nil
 	isProcessStep := config.Process != nil
-	isStandardStep := !isGenerateStep && !isProcessStep && config.Type != "openai-responses" // Standard steps are not generate, process, or openai-responses
+	isCodebaseIndexStep := config.Type == "codebase-index" || config.CodebaseIndex != nil
+	isQmdSearchStep := config.Type == "qmd-search" || config.QmdSearch != nil
+	isStandardStep := !isGenerateStep && !isProcessStep && !isCodebaseIndexStep && !isQmdSearchStep && config.Type != "openai-responses" // Standard steps are not generate, process, codebase-index, qmd-search, or openai-responses
 	isOpenAIResponsesStep := config.Type == "openai-responses"
 
 	// Ensure a step is of one type only
@@ -403,7 +851,7 @@ func (p *Processor) validateDependencies() error {
 		for _, step := range steps {
 			outputs := p.NormalizeStringSlice(step.Config.Output)
 			for _, output := range outputs {
-				if output != "STDOUT" {
+				if output != OutputSTDOUT {
 					// Check if this output is already produced by another parallel step
 					if producerStep, exists := parallelOutputs[output]; exists {
 						return fmt.Errorf("parallel step '%s' and '%s' both produce the same output file '%s', which creates a conflict",
@@ -421,7 +869,7 @@ func (p *Processor) validateDependencies() error {
 			// Check if this parallel step depends on outputs from other parallel steps
 			inputs := p.NormalizeStringSlice(step.Config.Input)
 			for _, input := range inputs {
-				if input != "NA" && input != "STDIN" {
+				if input != "NA" && input != InputSTDIN {
 					// Check if this input is an output from another parallel step
 					if producerStep, exists := parallelOutputs[input]; exists {
 						return fmt.Errorf("parallel step '%s' depends on output '%s' from parallel step '%s', which is not allowed",
@@ -439,7 +887,7 @@ func (p *Processor) validateDependencies() error {
 		var stepDependencies []string
 
 		for _, input := range inputs {
-			if input != "NA" && input != "STDIN" {
+			if input != "NA" && input != InputSTDIN {
 				// Check if this input is an output from another step
 				if producerStep, exists := outputFiles[input]; exists {
 					stepDependencies = append(stepDependencies, producerStep)
@@ -455,7 +903,7 @@ func (p *Processor) validateDependencies() error {
 		// Add this step's outputs to the map
 		outputs := p.NormalizeStringSlice(step.Config.Output)
 		for _, output := range outputs {
-			if output != "STDOUT" {
+			if output != OutputSTDOUT {
 				outputFiles[output] = step.Name
 			}
 		}
@@ -501,16 +949,59 @@ func (p *Processor) checkCircularDependencies(
 
 // Process executes the DSL processing pipeline
 func (p *Processor) Process() error {
+	hasLoops := len(p.config.Loops) > 0
+	hasSteps := len(p.config.Steps) > 0 || len(p.config.ParallelSteps) > 0 || len(p.config.AgenticLoops) > 0
+
+	// Check if we have anything to process
+	if !hasLoops && !hasSteps {
+		err := fmt.Errorf("no steps or loops defined in DSL configuration")
+		p.debugf("Validation error: %v", err)
+		p.emitError(err)
+		return fmt.Errorf("validation failed: %w", err)
+	}
+
+	// Set up worktrees if configured
+	if p.worktreeHandler != nil {
+		p.debugf("Setting up worktrees...")
+		if err := p.worktreeHandler.Setup(); err != nil {
+			return fmt.Errorf("failed to set up worktrees: %w", err)
+		}
+		// Ensure cleanup runs at the end
+		defer func() {
+			if cleanupErr := p.worktreeHandler.Cleanup(); cleanupErr != nil {
+				p.debugf("Warning: worktree cleanup failed: %v", cleanupErr)
+			}
+		}()
+	}
+
+	// If we have both steps and loops, run steps first as "pre-loop" steps
+	// This allows workflows to set up prerequisites (like codebase-index) before loops run
+	if hasSteps && hasLoops {
+		p.debugf("Detected hybrid workflow: %d steps + %d loops (steps will run first)",
+			len(p.config.Steps), len(p.config.Loops))
+		if err := p.processPreLoopSteps(); err != nil {
+			return err
+		}
+		return p.processMultiLoopOrchestration()
+	}
+
+	// Loops-only workflow
+	if hasLoops {
+		p.debugf("Detected multi-loop orchestration with %d loops", len(p.config.Loops))
+		return p.processMultiLoopOrchestration()
+	}
+
+	// Steps-only workflow (original behavior)
 	// Check if we have any steps to process
-	if len(p.config.Steps) == 0 && len(p.config.ParallelSteps) == 0 {
+	if len(p.config.Steps) == 0 && len(p.config.ParallelSteps) == 0 && len(p.config.AgenticLoops) == 0 {
 		err := fmt.Errorf("no steps defined in DSL configuration")
 		p.debugf("Validation error: %v", err)
 		p.emitError(err)
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	p.debugf("Initial validation passed: found %d sequential steps and %d parallel step groups",
-		len(p.config.Steps), len(p.config.ParallelSteps))
+	p.debugf("Initial validation passed: found %d sequential steps, %d parallel step groups, and %d agentic loops",
+		len(p.config.Steps), len(p.config.ParallelSteps), len(p.config.AgenticLoops))
 
 	// First validate all steps before processing
 	p.spinner.Start("Validating DSL configuration")
@@ -525,16 +1016,21 @@ func (p *Processor) Process() error {
 			p.spinner.Stop()
 			errMsg := fmt.Sprintf("Validation failed for step '%s': %v", step.Name, err)
 			p.debugf("Step validation error: %s", errMsg)
-			p.emitError(fmt.Errorf(errMsg))
+			p.emitError(fmt.Errorf("%s", errMsg))
 			return fmt.Errorf("validation error: %w", err)
 		}
 
-		// Validate model names only for standard or relevant steps
-		if step.Config.Generate == nil && step.Config.Process == nil && step.Config.Type != "openai-responses" {
+		// Validate model names only for standard steps (not generate, process, openai-responses, codebase-index, or qmd-search)
+		isCodebaseIndex := step.Config.Type == "codebase-index" || step.Config.CodebaseIndex != nil
+		isQmdSearch := step.Config.Type == "qmd-search" || step.Config.QmdSearch != nil
+		if step.Config.Generate == nil && step.Config.Process == nil && step.Config.Type != "openai-responses" && !isCodebaseIndex && !isQmdSearch {
 			modelNames := p.NormalizeStringSlice(step.Config.Model)
 			p.debugf("Normalized model names for step %s: %v", step.Name, modelNames)
-			if err := p.validateModel(modelNames, []string{"STDIN"}); err != nil { // STDIN is a placeholder here
-				p.debugf("Model validation failed for step %s: %v", step.Name, err)
+			if err := p.validateModel(modelNames, []string{InputSTDIN}); err != nil { // STDIN is a placeholder here
+				p.spinner.Stop()
+				errMsg := fmt.Sprintf("Model validation failed for step '%s': %v", step.Name, err)
+				p.debugf("Model validation error: %s", errMsg)
+				p.emitError(fmt.Errorf("%s", errMsg))
 				return fmt.Errorf("model validation failed for step %s: %w", step.Name, err)
 			}
 		}
@@ -554,16 +1050,21 @@ func (p *Processor) Process() error {
 				p.spinner.Stop()
 				errMsg := fmt.Sprintf("Validation failed for parallel step '%s': %v", step.Name, err)
 				p.debugf("Parallel step validation error: %s", errMsg)
-				p.emitError(fmt.Errorf(errMsg))
+				p.emitError(fmt.Errorf("%s", errMsg))
 				return fmt.Errorf("validation error: %w", err)
 			}
 
-			// Validate model names only for standard or relevant steps
-			if step.Config.Generate == nil && step.Config.Process == nil && step.Config.Type != "openai-responses" {
+			// Validate model names only for standard steps (not generate, process, openai-responses, codebase-index, or qmd-search)
+			isCodebaseIndex := step.Config.Type == "codebase-index" || step.Config.CodebaseIndex != nil
+			isQmdSearch := step.Config.Type == "qmd-search" || step.Config.QmdSearch != nil
+			if step.Config.Generate == nil && step.Config.Process == nil && step.Config.Type != "openai-responses" && !isCodebaseIndex && !isQmdSearch {
 				modelNames := p.NormalizeStringSlice(step.Config.Model)
 				p.debugf("Normalized model names for parallel step %s: %v", step.Name, modelNames)
-				if err := p.validateModel(modelNames, []string{"STDIN"}); err != nil { // STDIN is a placeholder
-					p.debugf("Model validation failed for parallel step %s: %v", step.Name, err)
+				if err := p.validateModel(modelNames, []string{InputSTDIN}); err != nil { // STDIN is a placeholder
+					p.spinner.Stop()
+					errMsg := fmt.Sprintf("Model validation failed for parallel step '%s': %v", step.Name, err)
+					p.debugf("Model validation error: %s", errMsg)
+					p.emitError(fmt.Errorf("%s", errMsg))
 					return fmt.Errorf("model validation failed for parallel step %s: %w", step.Name, err)
 				}
 			}
@@ -577,7 +1078,7 @@ func (p *Processor) Process() error {
 		p.spinner.Stop()
 		errMsg := fmt.Sprintf("Dependency validation failed: %v", err)
 		p.debugf("Dependency validation error: %s", errMsg)
-		p.emitError(fmt.Errorf(errMsg))
+		p.emitError(fmt.Errorf("%s", errMsg))
 		return fmt.Errorf("dependency validation error: %w", err)
 	}
 
@@ -666,6 +1167,23 @@ func (p *Processor) Process() error {
 		p.debugf("Completed all parallel steps in group: %s", groupName)
 	}
 
+	// Process agentic loops
+	for loopName, loopConfig := range p.config.AgenticLoops {
+		p.debugf("Starting agentic loop: %s", loopName)
+		p.spinner.Start(fmt.Sprintf("Processing agentic loop: %s", loopName))
+
+		output, err := p.processAgenticLoop(loopName, loopConfig, p.lastOutput)
+		if err != nil {
+			p.spinner.Stop()
+			p.emitError(err)
+			return fmt.Errorf("agentic loop error: %w", err)
+		}
+
+		p.lastOutput = output
+		p.spinner.Stop()
+		p.debugf("Completed agentic loop: %s", loopName)
+	}
+
 	// Process sequential steps
 	for stepIndex, step := range p.config.Steps {
 		stepInfo := &StepInfo{
@@ -685,13 +1203,23 @@ func (p *Processor) Process() error {
 		p.emitProgress(stepMsg, stepInfo)
 		p.spinner.Start(stepMsg)
 
+		// Set worktree context for this step (if specified)
+		if step.Config.Worktree != "" {
+			p.setCurrentStepWorktree(step.Config.Worktree)
+			p.debugf("Step '%s' using worktree: %s", step.Name, step.Config.Worktree)
+		}
+
 		// Process the step
 		response, err := p.processStep(step, false, "")
+
+		// Clear worktree context after step completes
+		p.clearCurrentStepWorktree()
+
 		if err != nil {
 			p.spinner.Stop()
 			errMsg := fmt.Sprintf("Error processing step '%s': %v", step.Name, err)
 			p.debugf("Step processing error: %s", errMsg)
-			p.emitError(fmt.Errorf(errMsg))
+			p.emitError(fmt.Errorf("%s", errMsg))
 			return fmt.Errorf("step processing error: %w", err)
 		}
 
@@ -714,30 +1242,70 @@ func (p *Processor) Process() error {
 	return nil
 }
 
+// tryDispatchSpecialStep attempts to dispatch special step types (generate, process, agentic loop, codebase-index).
+// Returns (result, handled, error). If handled is true, the step was processed.
+func (p *Processor) tryDispatchSpecialStep(step Step, isParallel bool, parallelID string, metrics *PerformanceMetrics, startTime time.Time) (string, bool, error) {
+	// Check if this is an openai-responses step
+	if step.Config.Type == "openai-responses" {
+		result, err := p.processResponsesStep(step, isParallel, parallelID)
+		return result, true, err
+	}
+
+	// Handle generate step
+	if step.Config.Generate != nil {
+		result, err := p.processGenerateStep(step, isParallel, parallelID, metrics, startTime)
+		return result, true, err
+	}
+
+	// Handle process step
+	if step.Config.Process != nil {
+		result, err := p.processProcessStep(step, isParallel, parallelID, metrics, startTime)
+		return result, true, err
+	}
+
+	// Handle inline agentic loop step
+	if step.Config.AgenticLoop != nil {
+		result, err := p.processInlineAgenticLoop(step)
+		return result, true, err
+	}
+
+	// Handle codebase-index step
+	if step.Config.Type == "codebase-index" || step.Config.CodebaseIndex != nil {
+		result, err := p.processCodebaseIndexStep(step, isParallel, parallelID)
+		return result, true, err
+	}
+
+	// Handle qmd-search step
+	if step.Config.Type == "qmd-search" || step.Config.QmdSearch != nil {
+		result, err := p.processQmdSearchStep(step, isParallel, parallelID)
+		return result, true, err
+	}
+
+	// Handle skill step
+	if step.Config.Skill != "" {
+		result, err := p.processSkillStep(step, isParallel, parallelID, metrics, startTime)
+		return result, true, err
+	}
+
+	return "", false, nil
+}
+
 // processStep handles the processing of a single step (used for both sequential and parallel processing)
 func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (string, error) {
 	// Create performance metrics for this step
 	metrics := &PerformanceMetrics{}
 	startTime := time.Now()
 
-	// Check if this is an openai-responses step
-	if step.Config.Type == "openai-responses" {
-		return p.processResponsesStep(step, isParallel, parallelID)
-	}
-
-	// Handle generate step
-	if step.Config.Generate != nil {
-		return p.processGenerateStep(step, isParallel, parallelID, metrics, startTime)
-	}
-
-	// Handle process step
-	if step.Config.Process != nil {
-		return p.processProcessStep(step, isParallel, parallelID, metrics, startTime)
+	// Try to dispatch special step types first
+	if result, handled, err := p.tryDispatchSpecialStep(step, isParallel, parallelID, metrics, startTime); handled {
+		return result, err
 	}
 
 	// Create a new handler for this step to avoid conflicts in parallel processing
 	stepHandler := input.NewHandler()
+	p.mu.Lock()
 	p.handler = stepHandler
+	p.mu.Unlock()
 
 	stepInfo := &StepInfo{
 		Name:   step.Name,
@@ -793,7 +1361,10 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 		} else if url, ok := v["url"].(string); ok {
 			// Handle scraping configuration
 			p.debugf("Scraping content from %s for step: %s", url, step.Name)
-			if err := p.handler.ProcessScrape(url, v); err != nil {
+			p.mu.Lock()
+			handler := p.handler
+			p.mu.Unlock()
+			if err := handler.ProcessScrape(url, v); err != nil {
 				return "", fmt.Errorf("failed to process scraping input: %w", err)
 			}
 		} else {
@@ -806,6 +1377,14 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	modelNames := p.NormalizeStringSlice(step.Config.Model)
 	actions := p.NormalizeStringSlice(step.Config.Action)
 
+	// Apply CLI variable substitution to inputs and actions
+	p.substituteCLIVariablesInSlice(inputs)
+	p.substituteCLIVariablesInSlice(actions)
+
+	// Apply step output variable substitution ($VARNAME) to inputs
+	// This allows steps to reference outputs from previous steps as file paths
+	p.substituteVariablesInSlice(inputs)
+
 	p.debugf("Step configuration:")
 	p.debugf("- Inputs: %v", inputs)
 	p.debugf("- Models: %v", modelNames)
@@ -814,7 +1393,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	// Handle STDIN specially
 	if len(inputs) == 1 {
 		input := inputs[0]
-		if strings.HasPrefix(input, "STDIN") {
+		if strings.HasPrefix(input, InputSTDIN) {
 			// Initialize empty input if none provided
 			if p.lastOutput == "" {
 				p.lastOutput = ""
@@ -832,7 +1411,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			tmpFile, err := os.CreateTemp("", "comanda-stdin-*.txt")
 			if err != nil {
 				err = fmt.Errorf("failed to create temp file for STDIN: %w", err)
-				fmt.Printf("Error in step '%s': %v\n", step.Name, err)
+				log.Printf("Error in step '%s': %v\n", step.Name, err)
 				return "", err
 			}
 			tmpPath := tmpFile.Name()
@@ -841,7 +1420,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			if _, err := tmpFile.WriteString(p.lastOutput); err != nil {
 				tmpFile.Close()
 				err = fmt.Errorf("failed to write to temp file: %w", err)
-				fmt.Printf("Error in step '%s': %v\n", step.Name, err)
+				log.Printf("Error in step '%s': %v\n", step.Name, err)
 				return "", err
 			}
 			tmpFile.Close()
@@ -851,6 +1430,67 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 		}
 	}
 
+	// Handle tool input (e.g., "tool: ls -la" or "tool: STDIN|grep pattern")
+	if len(inputs) == 1 && IsToolInput(inputs[0]) {
+		p.debugf("Processing tool input for step: %s", step.Name)
+
+		// Parse the tool command
+		command, usesStdin, err := ParseToolInput(inputs[0])
+		if err != nil {
+			return "", fmt.Errorf("failed to parse tool input for step '%s': %w", step.Name, err)
+		}
+
+		// Create tool executor with merged global + step-level configuration
+		stepToolConfig := &ToolConfig{}
+		if step.Config.ToolConfig != nil {
+			stepToolConfig.Allowlist = step.Config.ToolConfig.Allowlist
+			stepToolConfig.Denylist = step.Config.ToolConfig.Denylist
+			stepToolConfig.Timeout = step.Config.ToolConfig.Timeout
+		}
+		toolConfig := MergeToolConfigs(p.getGlobalToolConfig(), stepToolConfig)
+		executor := NewToolExecutor(toolConfig, p.verbose, p.debugf)
+
+		// Prepare stdin content if needed
+		var stdinContent string
+		if usesStdin {
+			stdinContent = p.lastOutput
+			p.debugf("Tool input uses STDIN, providing %d bytes of content", len(stdinContent))
+		}
+
+		// Execute the tool
+		stdout, stderr, err := executor.Execute(command, stdinContent)
+		if err != nil {
+			// Include stderr in the error message for debugging
+			if stderr != "" {
+				return "", fmt.Errorf("tool execution failed for step '%s': %w\nstderr: %s", step.Name, err, stderr)
+			}
+			return "", fmt.Errorf("tool execution failed for step '%s': %w", step.Name, err)
+		}
+
+		if stderr != "" {
+			p.debugf("Tool stderr: %s", stderr)
+		}
+
+		p.debugf("Tool output (%d bytes): %s", len(stdout), stdout[:min(200, len(stdout))])
+
+		// Create a temporary file with the tool output
+		tmpFile, err := os.CreateTemp("", "comanda-tool-*.txt")
+		if err != nil {
+			return "", fmt.Errorf("failed to create temp file for tool output: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		if _, err := tmpFile.WriteString(stdout); err != nil {
+			tmpFile.Close()
+			return "", fmt.Errorf("failed to write tool output to temp file: %w", err)
+		}
+		tmpFile.Close()
+
+		// Update inputs to use the temporary file
+		inputs = []string{tmpPath}
+	}
+
 	// Check if chunking is enabled for this step
 	var chunkResult *chunker.ChunkResult
 	if step.Config.Chunk != nil && len(inputs) == 1 {
@@ -858,7 +1498,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 		inputFile := inputs[0]
 
 		// Skip chunking for special inputs like STDIN
-		if inputFile != "STDIN" && inputFile != "NA" {
+		if inputFile != InputSTDIN && inputFile != "NA" {
 			p.debugf("Chunking enabled for step '%s', input file: %s", step.Name, inputFile)
 
 			// Convert the ChunkConfig from the YAML to the chunker's ChunkConfig
@@ -874,8 +1514,8 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			chunkResult, err = chunker.SplitFile(inputFile, chunkConfig)
 			if err != nil {
 				errMsg := fmt.Sprintf("Failed to chunk file '%s' for step '%s': %v", inputFile, step.Name, err)
-				p.debugf(errMsg)
-				return "", fmt.Errorf(errMsg)
+				p.debugf("%s", errMsg)
+				return "", fmt.Errorf("%s", errMsg)
 			}
 
 			p.debugf("Successfully chunked file '%s' into %d chunks", inputFile, chunkResult.TotalChunks)
@@ -888,7 +1528,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 				if err := chunker.CleanupChunks(chunkResult); err != nil {
 					p.debugf("Error cleaning up chunks for step '%s': %v", step.Name, err)
 					// Log the error but don't fail the step - cleanup errors are non-fatal
-					fmt.Printf("Warning: Failed to clean up temporary chunk files: %v\n", err)
+					log.Printf("Warning: Failed to clean up temporary chunk files: %v\n", err)
 				}
 			}()
 		}
@@ -899,7 +1539,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 		p.debugf("Processing inputs for step %s...", step.Name)
 		if err := p.processInputs(inputs); err != nil {
 			err = fmt.Errorf("input processing error in step %s: %w", step.Name, err)
-			fmt.Printf("Error: %v\n", err)
+			log.Printf("Error: %v\n", err)
 			return "", err
 		}
 	}
@@ -949,9 +1589,12 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 		substituted := p.substituteVariables(action)
 
 		// If we're processing chunks, add chunk-specific placeholders
-		if chunkResult != nil && len(p.handler.GetInputs()) > 0 {
+		p.mu.Lock()
+		handlerInputs := p.handler.GetInputs()
+		p.mu.Unlock()
+		if chunkResult != nil && len(handlerInputs) > 0 {
 			// Get the current chunk index from the input path
-			currentInput := p.handler.GetInputs()[0]
+			currentInput := handlerInputs[0]
 			chunkIndex := -1
 			for i, chunkPath := range chunkResult.ChunkPaths {
 				if chunkPath == currentInput.Path {
@@ -968,6 +1611,58 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			}
 		}
 
+		// If memory is enabled for this step, inject memory content
+		if step.Config.Memory.Legacy {
+			var memoryContent string
+
+			// Combine file-based memory and external memory context
+			if p.memory != nil && p.memory.HasMemory() {
+				memoryContent = p.memory.GetMemory()
+			}
+
+			// Append external memory context if available
+			if p.externalMemory != "" {
+				if memoryContent != "" {
+					memoryContent = memoryContent + "\n\n" + p.externalMemory
+				} else {
+					memoryContent = p.externalMemory
+				}
+			}
+
+			if memoryContent != "" {
+				// Prepend memory context to the action
+				memoryPrefix := fmt.Sprintf("Context from project memory:\n---\n%s\n---\n\n", memoryContent)
+				substituted = memoryPrefix + substituted
+				p.debugf("Injected memory context into action (memory length: %d chars)", len(memoryContent))
+			}
+		}
+
+		if semanticMemory := p.semanticMemoryContext(step); semanticMemory != "" {
+			substituted = semanticMemory + substituted
+		}
+
+		// If incremental output mode, load existing file content as context
+		if incrementalContext := p.loadIncrementalContext(&step.Config); incrementalContext != "" {
+			substituted = incrementalContext + substituted
+			p.debugf("Injected incremental context (existing file content: %d chars)", len(incrementalContext))
+		}
+
+		// If output is a file path, inject context so agents know to output content directly.
+		// This helps agents (especially Claude Code in --print mode) understand that they
+		// should output content directly rather than attempting to write files themselves.
+		// Skip this when in agentic mode - the agent can write files directly.
+		agenticConfig := p.getAgenticConfig()
+		isAgenticMode := agenticConfig != nil && len(agenticConfig.AllowedPaths) > 0
+		if !isAgenticMode {
+			if outputPath := getFileOutputPath(step.Config.Output); outputPath != "" {
+				outputContext := "[Output Handling]\nSimply output the content directly. Do not attempt to write files - your output will be captured automatically.\n\n"
+				substituted = outputContext + substituted
+				p.debugf("Injected output context into action (output path: %s)", outputPath)
+			}
+		} else {
+			p.debugf("Skipping output context injection - agentic mode enabled")
+		}
+
 		substitutedActions[i] = substituted
 		if original != substituted {
 			p.debugf("Variable substitution: original='%s' substituted='%s'", original, substituted)
@@ -975,7 +1670,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	}
 
 	p.debugf("Executing actions: models=%v actions=%v", modelNames, substitutedActions)
-	response, err := p.processActions(modelNames, substitutedActions)
+	actionResult, err := p.processActions(modelNames, substitutedActions, &step.Config)
 	if err != nil {
 		errMsg := fmt.Sprintf("Action processing failed for step '%s': %v (models=%v actions=%v)",
 			step.Name, err, modelNames, substitutedActions)
@@ -994,13 +1689,21 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	// Handle output for this step
 	p.debugf("Handling output for step: %s", step.Name)
 
+	// Determine the final response to return (for downstream steps)
+	var finalResponse string
+
 	// Handle output based on type
 	var handled bool
 	switch v := step.Config.Output.(type) {
 	case map[string]interface{}:
 		if _, hasDB := v["database"]; hasDB {
 			p.debugf("Processing database output for step '%s'", step.Name)
-			if err := p.handleDatabaseOutput(response, v); err != nil {
+			// For database output, use combined result if available, otherwise join individual results
+			dbOutput := actionResult.CombinedResult
+			if actionResult.HasIndividualResults {
+				dbOutput = strings.Join(actionResult.IndividualResults, "\n\n")
+			}
+			if err := p.handleDatabaseOutput(dbOutput, v); err != nil {
 				errMsg := fmt.Sprintf("Database output processing failed for step '%s': %v (config=%v)",
 					step.Name, err, v)
 				p.debugf("Database output error: %s", errMsg)
@@ -1009,7 +1712,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 
 			// For database outputs, we still want to show performance metrics in STDOUT
 			if p.verbose {
-				fmt.Printf("\nPerformance Metrics for step '%s':\n"+
+				log.Printf("\nPerformance Metrics for step '%s':\n"+
 					"- Input processing: %d ms\n"+
 					"- Model processing: %d ms\n"+
 					"- Action processing: %d ms\n"+
@@ -1022,6 +1725,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			}
 
 			p.debugf("Successfully processed database output for step: %s", step.Name)
+			finalResponse = dbOutput
 			handled = true
 		}
 	}
@@ -1029,15 +1733,94 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 	// Handle regular output if not already handled
 	if !handled {
 		outputs := p.NormalizeStringSlice(step.Config.Output)
-		p.debugf("Processing regular output for step '%s': model=%s outputs=%v",
-			step.Name, modelNames[0], outputs)
-		if err := p.handleOutput(modelNames[0], response, outputs, metrics); err != nil {
-			errMsg := fmt.Sprintf("Output processing failed for step '%s': %v (model=%s outputs=%v)",
-				step.Name, err, modelNames[0], outputs)
-			p.debugf("Output processing error: %s", errMsg)
-			return "", fmt.Errorf("output handling error: %w", err)
+
+		// Handle individual results from either chunking or batch_mode: individual
+		if actionResult.HasIndividualResults {
+			p.debugf("Processing individual results (%d results)", len(actionResult.IndividualResults))
+
+			// Determine the total count for template substitution
+			totalCount := len(actionResult.IndividualResults)
+
+			// For chunking, we may have explicit chunk info
+			if chunkResult != nil {
+				totalCount = chunkResult.TotalChunks
+			}
+
+			// Process each individual result with its own output file
+			for idx, result := range actionResult.IndividualResults {
+				// Safety check: ensure we have a corresponding input path
+				if idx >= len(actionResult.InputPaths) {
+					p.debugf("Warning: No input path for result at index %d, skipping", idx)
+					continue
+				}
+
+				// Determine the index for this result
+				var fileIndex int
+
+				if chunkResult != nil && chunkResult.ChunkPaths != nil {
+					// For chunking: Find chunk index for this input path
+					chunkIndex := -1
+					for i, chunkPath := range chunkResult.ChunkPaths {
+						if chunkPath == actionResult.InputPaths[idx] {
+							chunkIndex = i
+							break
+						}
+					}
+
+					if chunkIndex < 0 {
+						p.debugf("Warning: Could not find chunk index for path %s", actionResult.InputPaths[idx])
+						continue
+					}
+					fileIndex = chunkIndex
+				} else {
+					// For batch_mode: individual without chunking, use array index
+					fileIndex = idx
+				}
+
+				// Substitute template variables in output filename
+				substitutedOutputs := make([]string, len(outputs))
+				for i, output := range outputs {
+					substituted := output
+					substituted = strings.ReplaceAll(substituted, "{{ chunk_index }}", fmt.Sprintf("%d", fileIndex))
+					substituted = strings.ReplaceAll(substituted, "{{ total_chunks }}", fmt.Sprintf("%d", totalCount))
+					// Also support {{ file_index }} as an alias for clarity in batch mode
+					substituted = strings.ReplaceAll(substituted, "{{ file_index }}", fmt.Sprintf("%d", fileIndex))
+					substituted = strings.ReplaceAll(substituted, "{{ total_files }}", fmt.Sprintf("%d", totalCount))
+					substitutedOutputs[i] = substituted
+					if output != substituted {
+						p.debugf("File %d output filename substitution: original='%s' substituted='%s'", fileIndex, output, substituted)
+					}
+				}
+
+				// Write this result to its corresponding output file
+				p.debugf("Writing file %d/%d result to output", fileIndex, totalCount)
+				if err := p.handleOutputForStep(modelNames[0], result, substitutedOutputs, metrics, &step.Config); err != nil {
+					errMsg := fmt.Sprintf("Output processing failed for file %d of step '%s': %v",
+						fileIndex, step.Name, err)
+					p.debugf("Output processing error: %s", errMsg)
+					return "", fmt.Errorf("output handling error: %w", err)
+				}
+			}
+
+			// Combine all results for the return value (for downstream steps)
+			finalResponse = strings.Join(actionResult.IndividualResults, "\n\n")
+			p.debugf("Successfully processed all %d individual outputs for step: %s", len(actionResult.IndividualResults), step.Name)
+
+		} else {
+			// Standard output handling (single result or combined mode)
+			response := actionResult.CombinedResult
+
+			p.debugf("Processing regular output for step '%s': model=%s outputs=%v mode=%s",
+				step.Name, modelNames[0], outputs, step.Config.OutputMode)
+			if err := p.handleOutputForStep(modelNames[0], response, outputs, metrics, &step.Config); err != nil {
+				errMsg := fmt.Sprintf("Output processing failed for step '%s': %v (model=%s outputs=%v)",
+					step.Name, err, modelNames[0], outputs)
+				p.debugf("Output processing error: %s", errMsg)
+				return "", fmt.Errorf("output handling error: %w", err)
+			}
+			finalResponse = response
+			p.debugf("Successfully processed output for step: %s", step.Name)
 		}
-		p.debugf("Successfully processed output for step: %s", step.Name)
 	}
 
 	// Record output processing time
@@ -1069,7 +1852,7 @@ func (p *Processor) processStep(step Step, isParallel bool, parallelID string) (
 			metrics)
 	}
 
-	return response, nil
+	return finalResponse, nil
 }
 
 // processGenerateStep handles the logic for a 'generate' step
@@ -1103,11 +1886,7 @@ func (p *Processor) processGenerateStep(step Step, isParallel bool, parallelID s
 	}
 	p.debugf("Using model '%s' for workflow generation in step '%s'", genModelName, step.Name)
 
-	// 2. Prepare the prompt for the LLM
-	//    This includes the Comanda DSL guide and the user's action.
-	// Use the embedded guide with injected model names instead of reading from file
-	dslGuide := []byte(GetEmbeddedLLMGuide())
-
+	// 2. Prepare the prompt for the LLM.
 	userAction := ""
 	if actions := p.NormalizeStringSlice(step.Config.Generate.Action); len(actions) > 0 {
 		userAction = actions[0] // Assuming single action for generation prompt
@@ -1115,12 +1894,13 @@ func (p *Processor) processGenerateStep(step Step, isParallel bool, parallelID s
 	if userAction == "" {
 		return "", fmt.Errorf("action for generate step '%s' is empty", step.Name)
 	}
+	dslGuide := []byte(GetGenerationGuideWithModels(nil, userAction))
 
 	// Handle input for generate step (e.g., from STDIN or context_files)
 	var contextInput string
 	if step.Config.Input != nil {
 		inputValStr := fmt.Sprintf("%v", step.Config.Input)
-		if inputValStr == "STDIN" {
+		if inputValStr == InputSTDIN {
 			contextInput = p.lastOutput
 			p.debugf("Generate step '%s' using STDIN content as part of prompt context.", step.Name)
 		} else if inputValStr != "NA" && inputValStr != "" {
@@ -1199,7 +1979,7 @@ IMPORTANT: When specifying models in the generated YAML, you MUST use one of the
 	// }
 
 	// Assuming provider is already configured via configureProviders() or similar mechanism
-	generatedResponse, err := provider.SendPrompt(genModelName, fullPrompt)
+	generatedResponse, err := provider.SendPrompt(p.resolveModelTarget(genModelName), fullPrompt)
 	if err != nil {
 		return "", fmt.Errorf("LLM execution failed for generate step '%s' with model '%s': %w", step.Name, genModelName, err)
 	}
@@ -1290,9 +2070,9 @@ func (p *Processor) processProcessStep(step Step, isParallel bool, parallelID st
 
 	// 2. Create a new Processor for the sub-workflow
 	//    It inherits verbose settings and envConfig, but has its own DSLConfig and variables.
-	//    The runtimeDir for the sub-processor could be the directory of the sub-workflow file or inherited.
-	//    For now, let's assume it inherits the parent's runtimeDir.
 	subProcessor := NewProcessor(&subDSLConfig, p.envConfig, p.serverConfig, p.verbose, p.runtimeDir)
+	subProcessor.SetSourceRoot(p.sourceRoot)
+	subProcessor.SetWorkflowFile(subWorkflowPath)
 	if p.progress != nil { // Propagate progress writer if available
 		subProcessor.SetProgressWriter(p.progress)
 	}
@@ -1312,7 +2092,7 @@ func (p *Processor) processProcessStep(step Step, isParallel bool, parallelID st
 	}
 
 	// If the parent 'process' step received STDIN, pass it to the sub-processor's lastOutput
-	if inputValStr := fmt.Sprintf("%v", step.Config.Input); inputValStr == "STDIN" {
+	if inputValStr := fmt.Sprintf("%v", step.Config.Input); inputValStr == InputSTDIN {
 		subProcessor.SetLastOutput(p.lastOutput)
 		p.debugf("Passing STDIN from parent step '%s' to sub-workflow '%s'", step.Name, subWorkflowPath)
 	}
@@ -1447,14 +2227,41 @@ func (p *Processor) validateGeneratedWorkflow(yamlContent string) error {
 		p.debugf("Checking if model '%s' in generated workflow is valid", modelName)
 
 		// Check if provider exists for this model
-		provider := models.DetectProvider(modelName)
+		resolvedModelName := p.resolveModelTarget(modelName)
+		provider := models.DetectProvider(resolvedModelName)
 		if provider == nil {
-			invalidModels = append(invalidModels, fmt.Sprintf("%s (no provider found)", modelName))
-			continue
+			if providerName, _, err := p.resolveConfiguredModel(modelName); err == nil {
+				switch providerName {
+				case "openai":
+					provider = models.NewOpenAIProvider()
+				case "anthropic":
+					provider = models.NewAnthropicProvider()
+				case "google":
+					provider = models.NewGoogleProvider()
+				case "xai":
+					provider = models.NewXAIProvider()
+				case "deepseek":
+					provider = models.NewDeepseekProvider()
+				case "moonshot":
+					provider = models.NewMoonshotProvider()
+				case "sakana":
+					provider = models.NewSakanaProvider()
+				case "ollama":
+					provider = models.NewOllamaProvider()
+				case "vllm":
+					provider = models.NewVLLMProvider()
+				case "llama.cpp":
+					provider = models.NewLlamaCPPProvider()
+				}
+			}
+			if provider == nil {
+				invalidModels = append(invalidModels, fmt.Sprintf("%s (no provider found)", modelName))
+				continue
+			}
 		}
 
 		// Check if provider supports this model
-		if !provider.SupportsModel(modelName) {
+		if !provider.SupportsModel(resolvedModelName) {
 			invalidModels = append(invalidModels, fmt.Sprintf("%s (not supported by %s)", modelName, provider.Name()))
 			continue
 		}
@@ -1534,50 +2341,551 @@ func (p *Processor) handleDeferredStep() error {
 	return nil
 }
 
+// SetProvider pre-registers an already-configured models.Provider, letting
+// embedders (library callers) supply a provider that bypasses envConfig
+// entirely. validateModel, configureProviders, and getProviderForModel all
+// treat providers registered this way as already configured.
+func (p *Processor) SetProvider(pr models.Provider) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.providers == nil {
+		p.providers = make(map[string]models.Provider)
+	}
+	if p.preConfiguredNames == nil {
+		p.preConfiguredNames = make(map[string]bool)
+	}
+	p.providers[pr.Name()] = pr
+	p.preConfiguredNames[pr.Name()] = true
+}
+
 // getProviderForModel retrieves a model provider based on the model name
 func (p *Processor) getProviderForModel(modelName string) (models.Provider, error) {
-	// First, check if the provider is already initialized
+	resolvedModelName := p.resolveModelTarget(modelName)
+
+	// First, check if the provider is already initialized (also covers
+	// providers pre-registered via SetProvider)
 	for _, provider := range p.providers {
-		if provider.SupportsModel(modelName) {
+		if provider.SupportsModel(resolvedModelName) {
 			return provider, nil
 		}
 	}
 
-	// If not initialized, find the provider in the environment configuration
-	for providerName, providerConfig := range p.envConfig.Providers {
-		for _, model := range providerConfig.Models {
-			if model.Name == modelName {
-				// Initialize the provider if it's not already in the map
-				if _, ok := p.providers[providerName]; !ok {
-					var newProvider models.Provider
-					switch providerName {
-					case "openai":
-						newProvider = models.NewOpenAIProvider()
-					case "anthropic":
-						newProvider = models.NewAnthropicProvider()
-					case "google":
-						newProvider = models.NewGoogleProvider()
-					case "xai":
-						newProvider = models.NewXAIProvider()
-					case "deepseek":
-						newProvider = models.NewDeepseekProvider()
-					case "moonshot":
-						newProvider = models.NewMoonshotProvider()
-					case "ollama":
-						newProvider = models.NewOllamaProvider()
-					default:
-						return nil, fmt.Errorf("unknown provider: %s", providerName)
-					}
-					if err := newProvider.Configure(providerConfig.APIKey); err != nil {
-						return nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
-					}
-					newProvider.SetVerbose(p.verbose)
-					p.providers[providerName] = newProvider
+	providerName, _, err := p.resolveConfiguredModel(modelName)
+	if err != nil {
+		return nil, fmt.Errorf("no provider configured or found for model %s", modelName)
+	}
+	providerConfig := p.envConfig.Providers[providerName]
+
+	if _, ok := p.providers[providerName]; !ok {
+		var newProvider models.Provider
+		switch providerName {
+		case "openai":
+			newProvider = models.NewOpenAIProvider()
+		case "anthropic":
+			newProvider = models.NewAnthropicProvider()
+		case "google":
+			newProvider = models.NewGoogleProvider()
+		case "xai":
+			newProvider = models.NewXAIProvider()
+		case "deepseek":
+			newProvider = models.NewDeepseekProvider()
+		case "moonshot":
+			newProvider = models.NewMoonshotProvider()
+		case "sakana":
+			newProvider = models.NewSakanaProvider()
+		case "ollama":
+			newProvider = models.NewOllamaProvider()
+		case "vllm":
+			newProvider = models.NewVLLMProvider()
+		case "llama.cpp":
+			newProvider = models.NewLlamaCPPProvider()
+		case "bedrock":
+			newProvider = models.NewBedrockProvider()
+		default:
+			return nil, fmt.Errorf("unknown provider: %s", providerName)
+		}
+		// Bedrock uses the AWS credential chain rather than an api_key, and may
+		// not have a configured envConfig entry at all.
+		apiKey := ""
+		if providerConfig != nil {
+			apiKey = providerConfig.APIKey
+		}
+		if err := newProvider.Configure(apiKey); err != nil {
+			return nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+		}
+		newProvider.SetVerbose(p.verbose)
+		p.providers[providerName] = newProvider
+	}
+
+	return p.providers[providerName], nil
+}
+
+// processPreLoopSteps processes all steps (sequential, parallel, agentic loops) before multi-loop orchestration.
+// This allows hybrid workflows where steps set up prerequisites (e.g., codebase-index) that loops depend on.
+func (p *Processor) processPreLoopSteps() error {
+	p.debugf("Processing pre-loop steps: %d sequential, %d parallel groups, %d agentic loops",
+		len(p.config.Steps), len(p.config.ParallelSteps), len(p.config.AgenticLoops))
+
+	// Validate steps first
+	p.spinner.Start("Validating pre-loop steps")
+
+	for _, step := range p.config.Steps {
+		if err := p.validateStepConfig(step.Name, step.Config); err != nil {
+			p.spinner.Stop()
+			return fmt.Errorf("validation failed for pre-loop step '%s': %w", step.Name, err)
+		}
+	}
+
+	p.spinner.Stop()
+
+	// Process parallel steps first if any
+	for groupName, steps := range p.config.ParallelSteps {
+		p.spinner.Start(fmt.Sprintf("Processing parallel step group: %s", groupName))
+		p.debugf("Starting parallel processing for group '%s' with %d steps", groupName, len(steps))
+
+		type stepResult struct {
+			name   string
+			output string
+		}
+
+		resultChan := make(chan stepResult, len(steps))
+		errorChan := make(chan error, len(steps))
+		var wg sync.WaitGroup
+
+		for _, step := range steps {
+			wg.Add(1)
+			stepCopy := step
+			go func() {
+				defer wg.Done()
+				response, err := p.processStep(stepCopy, true, groupName)
+				if err != nil {
+					errorChan <- fmt.Errorf("error in parallel step '%s': %w", stepCopy.Name, err)
+					return
 				}
-				return p.providers[providerName], nil
+				resultChan <- stepResult{name: stepCopy.Name, output: response}
+			}()
+		}
+
+		go func() {
+			wg.Wait()
+			close(resultChan)
+			close(errorChan)
+		}()
+
+		for err := range errorChan {
+			p.spinner.Stop()
+			return err
+		}
+
+		for result := range resultChan {
+			p.debugf("Collected result from parallel step: %s", result.name)
+		}
+
+		p.spinner.Stop()
+	}
+
+	// Process agentic loops (legacy top-level loops, not the new multi-loop orchestration)
+	for loopName, loopConfig := range p.config.AgenticLoops {
+		p.spinner.Start(fmt.Sprintf("Processing agentic loop: %s", loopName))
+		output, err := p.processAgenticLoop(loopName, loopConfig, p.lastOutput)
+		if err != nil {
+			p.spinner.Stop()
+			return fmt.Errorf("agentic loop error: %w", err)
+		}
+		p.lastOutput = output
+		p.spinner.Stop()
+	}
+
+	// Process sequential steps
+	for stepIndex, step := range p.config.Steps {
+		stepMsg := fmt.Sprintf("Processing pre-loop step %d/%d: %s", stepIndex+1, len(p.config.Steps), step.Name)
+		p.spinner.Start(stepMsg)
+		p.debugf("%s", stepMsg)
+
+		response, err := p.processStep(step, false, "")
+		if err != nil {
+			p.spinner.Stop()
+			return fmt.Errorf("error processing pre-loop step '%s': %w", step.Name, err)
+		}
+
+		p.lastOutput = response
+		p.spinner.Stop()
+		p.debugf("Successfully processed pre-loop step: %s", step.Name)
+
+		// Handle deferred step if any
+		if err := p.handleDeferredStep(); err != nil {
+			return err
+		}
+
+		p.handler = input.NewHandler()
+	}
+
+	p.debugf("All pre-loop steps completed successfully")
+	return nil
+}
+
+// processMultiLoopOrchestration handles multi-loop workflows
+func (p *Processor) processMultiLoopOrchestration() error {
+	// Determine which loops to execute
+	loopsToExecute := p.config.Loops
+
+	// If workflow is specified, process it (creator/checker pattern)
+	if len(p.config.Workflow) > 0 {
+		return p.processWorkflow()
+	}
+
+	// If execute_loops is specified, filter loops
+	if len(p.config.ExecuteLoops) > 0 {
+		filtered := make(map[string]*AgenticLoopConfig)
+		for _, loopName := range p.config.ExecuteLoops {
+			if config, exists := p.config.Loops[loopName]; exists {
+				filtered[loopName] = config
+			} else {
+				return fmt.Errorf("loop '%s' specified in execute_loops not found in loops", loopName)
+			}
+		}
+		loopsToExecute = filtered
+	}
+
+	// Show workflow header with progress display
+	workflowName := "Multi-Loop Orchestration"
+	if p.workflowFile != "" {
+		workflowName = p.workflowFile
+	} else if p.runtimeDir != "" {
+		workflowName = p.runtimeDir
+	}
+	p.progressDisplay.StartWorkflow(workflowName, len(loopsToExecute))
+
+	// Create orchestrator
+	orchestrator := NewLoopOrchestrator(p, loopsToExecute, p.workflowFile)
+	orchestrator.SetProgressDisplay(p.progressDisplay)
+
+	// Build dependency graph and show execution order
+	graph, err := orchestrator.buildDependencyGraph()
+	if err != nil {
+		p.progressDisplay.FailWorkflow(err)
+		return fmt.Errorf("failed to build dependency graph: %w", err)
+	}
+	orchestrator.executionGraph = graph
+
+	executionOrder, err := graph.TopologicalSort()
+	if err != nil {
+		p.progressDisplay.FailWorkflow(err)
+		return fmt.Errorf("failed to determine execution order: %w", err)
+	}
+
+	// Show dependency graph
+	p.progressDisplay.ShowDependencyGraph(executionOrder)
+
+	// Execute loops
+	if err := orchestrator.ExecuteWithOrder(executionOrder); err != nil {
+		p.progressDisplay.FailWorkflow(err)
+		return fmt.Errorf("orchestration failed: %w", err)
+	}
+
+	// Show completion summary
+	outputs := orchestrator.GetAllOutputs()
+	p.progressDisplay.CompleteWorkflow(outputs)
+
+	log.Println("\n=== Orchestration Complete ===")
+	return nil
+}
+
+// processWorkflow handles workflow-based orchestration with creator/checker patterns
+func (p *Processor) processWorkflow() error {
+	p.debugf("Processing workflow with %d nodes", len(p.config.Workflow))
+
+	// Build execution order from workflow
+	executionOrder, err := p.buildWorkflowExecutionOrder()
+	if err != nil {
+		return fmt.Errorf("failed to build workflow execution order: %w", err)
+	}
+
+	p.debugf("Workflow execution order: %v", executionOrder)
+
+	// Execute workflow nodes
+	loopOutputs := make(map[string]*LoopOutput)
+	maxRerunAttempts := 3 // Maximum times to rerun creator on checker failure
+
+	for _, nodeName := range executionOrder {
+		node := p.config.Workflow[nodeName]
+		if node == nil {
+			return fmt.Errorf("workflow node '%s' not found", nodeName)
+		}
+
+		p.spinner.Stop()
+		p.spinner.Start(fmt.Sprintf("Executing workflow node: %s (%s)", nodeName, node.Role))
+
+		// Handle different node types
+		switch node.Type {
+		case "loop", "":
+			// Execute loop
+			loopConfig := p.config.Loops[node.Loop]
+			if loopConfig == nil {
+				return fmt.Errorf("loop '%s' referenced by workflow node '%s' not found", node.Loop, nodeName)
+			}
+
+			// Prepare input
+			input, err := p.prepareWorkflowNodeInput(loopConfig, loopOutputs)
+			if err != nil {
+				return fmt.Errorf("failed to prepare input for node '%s': %w", nodeName, err)
+			}
+
+			// Execute loop with potential rerun logic for checker nodes
+			var output *LoopOutput
+			if node.Role == "checker" && node.Validates != "" {
+				output, err = p.executeCheckerLoop(node, loopConfig, input, loopOutputs, maxRerunAttempts)
+			} else {
+				output, err = p.executeWorkflowLoop(node.Loop, loopConfig, input)
+			}
+
+			if err != nil {
+				return fmt.Errorf("workflow node '%s' failed: %w", nodeName, err)
+			}
+
+			loopOutputs[node.Loop] = output
+			p.debugf("Workflow node '%s' completed with status: %s", nodeName, output.Status)
+
+		default:
+			return fmt.Errorf("unsupported workflow node type: %s", node.Type)
+		}
+	}
+
+	// Output results
+	p.spinner.Stop()
+	log.Println("\n=== Workflow Results ===")
+	for nodeName, node := range p.config.Workflow {
+		if node.Type == "loop" || node.Type == "" {
+			output := loopOutputs[node.Loop]
+			if output != nil {
+				duration := output.EndTime.Sub(output.StartTime)
+				log.Printf("\nNode: %s (Role: %s)", nodeName, node.Role)
+				log.Printf("  Loop: %s", node.Loop)
+				log.Printf("  Status: %s", output.Status)
+				log.Printf("  Duration: %s", duration)
+			}
+		}
+	}
+	log.Println("\n=== Workflow Complete ===")
+
+	return nil
+}
+
+// buildWorkflowExecutionOrder builds execution order from workflow definition
+func (p *Processor) buildWorkflowExecutionOrder() ([]string, error) {
+	// Build dependency graph based on validates relationships
+	deps := make(map[string][]string)
+	nodes := make(map[string]bool)
+
+	for nodeName, node := range p.config.Workflow {
+		nodes[nodeName] = true
+		if node.Validates != "" {
+			// Checker depends on creator
+			deps[nodeName] = []string{node.Validates}
+		} else {
+			deps[nodeName] = []string{}
+		}
+	}
+
+	// Topological sort
+	return topologicalSort(nodes, deps)
+}
+
+// prepareWorkflowNodeInput prepares input for a workflow node
+func (p *Processor) prepareWorkflowNodeInput(config *AgenticLoopConfig, outputs map[string]*LoopOutput) (string, error) {
+	// Check for input_state variable
+	if config.InputState != "" {
+		value, exists := p.variables[config.InputState]
+		if !exists {
+			return "", fmt.Errorf("input variable '%s' not found", config.InputState)
+		}
+		return value, nil
+	}
+
+	// Check for dependencies
+	if len(config.DependsOn) > 0 {
+		firstDep := config.DependsOn[0]
+		output, exists := outputs[firstDep]
+		if !exists {
+			return "", fmt.Errorf("dependency loop '%s' has not completed", firstDep)
+		}
+		return output.Result, nil
+	}
+
+	return "NA", nil
+}
+
+// executeWorkflowLoop executes a single loop in the workflow
+func (p *Processor) executeWorkflowLoop(loopName string, config *AgenticLoopConfig, input string) (*LoopOutput, error) {
+	startTime := time.Now()
+	result, err := p.processAgenticLoopWithFile(loopName, config, input, p.workflowFile)
+	endTime := time.Now()
+
+	output := &LoopOutput{
+		LoopName:  loopName,
+		StartTime: startTime,
+		EndTime:   endTime,
+		Result:    result,
+		Variables: make(map[string]string),
+	}
+
+	if err != nil {
+		output.Status = "failed"
+		return output, err
+	}
+
+	output.Status = "completed"
+
+	// Export variables if output_state is specified
+	if config.OutputState != "" {
+		p.variables[config.OutputState] = result
+		output.Variables[config.OutputState] = result
+	}
+
+	return output, nil
+}
+
+// executeCheckerLoop executes a checker loop with rerun logic
+func (p *Processor) executeCheckerLoop(node *WorkflowNode, config *AgenticLoopConfig, input string, outputs map[string]*LoopOutput, maxAttempts int) (*LoopOutput, error) {
+	creatorNodeName := node.Validates
+	creatorNode := p.config.Workflow[creatorNodeName]
+	if creatorNode == nil {
+		return nil, fmt.Errorf("creator node '%s' not found", creatorNodeName)
+	}
+
+	creatorLoopName := creatorNode.Loop
+	creatorConfig := p.config.Loops[creatorLoopName]
+	if creatorConfig == nil {
+		return nil, fmt.Errorf("creator loop '%s' not found", creatorLoopName)
+	}
+
+	attempts := 0
+	for attempts < maxAttempts {
+		attempts++
+		p.debugf("Checker attempt %d/%d", attempts, maxAttempts)
+
+		// Execute checker loop
+		output, err := p.executeWorkflowLoop(node.Loop, config, input)
+		if err != nil {
+			return output, err
+		}
+
+		// Check if validation passed
+		// Look for "PASS" in the output (simple heuristic)
+		if strings.Contains(strings.ToUpper(output.Result), "PASS") {
+			p.debugf("Checker passed on attempt %d", attempts)
+			return output, nil
+		}
+
+		// Validation failed
+		p.debugf("Checker failed on attempt %d", attempts)
+
+		// Handle failure based on on_fail policy
+		switch node.OnFail {
+		case "rerun_creator":
+			if attempts >= maxAttempts {
+				return output, fmt.Errorf("checker failed after %d attempts", maxAttempts)
+			}
+
+			p.spinner.Stop()
+			p.spinner.Start(fmt.Sprintf("Re-running creator: %s (attempt %d/%d)", creatorLoopName, attempts+1, maxAttempts))
+
+			// Re-run creator
+			creatorInput := "NA"
+			if creatorConfig.InputState != "" {
+				if value, exists := p.variables[creatorConfig.InputState]; exists {
+					creatorInput = value
+				}
+			}
+
+			creatorOutput, err := p.executeWorkflowLoop(creatorLoopName, creatorConfig, creatorInput)
+			if err != nil {
+				return nil, fmt.Errorf("creator rerun failed: %w", err)
+			}
+
+			outputs[creatorLoopName] = creatorOutput
+
+			// Update input for next checker attempt
+			if creatorConfig.OutputState != "" {
+				input = p.variables[creatorConfig.OutputState]
+			} else {
+				input = creatorOutput.Result
+			}
+
+		case "abort":
+			return output, fmt.Errorf("checker failed, aborting workflow")
+
+		case "manual":
+			// Just return the failed output for manual review
+			return output, nil
+
+		default:
+			// Default to abort
+			return output, fmt.Errorf("checker failed")
+		}
+	}
+
+	return nil, fmt.Errorf("checker failed after %d rerun attempts", maxAttempts)
+}
+
+// topologicalSort performs topological sort on a dependency graph
+func topologicalSort(nodes map[string]bool, deps map[string][]string) ([]string, error) {
+	inDegree := make(map[string]int)
+	for node := range nodes {
+		inDegree[node] = len(deps[node])
+	}
+
+	queue := []string{}
+	for node, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, node)
+		}
+	}
+
+	result := []string{}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		result = append(result, current)
+
+		// Find nodes that depend on current
+		for node, nodeDeps := range deps {
+			for _, dep := range nodeDeps {
+				if dep == current {
+					inDegree[node]--
+					if inDegree[node] == 0 {
+						queue = append(queue, node)
+					}
+				}
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no provider configured or found for model %s", modelName)
+	if len(result) != len(nodes) {
+		return nil, fmt.Errorf("cycle detected in workflow dependencies")
+	}
+
+	return result, nil
+}
+
+// getFileOutputPath returns the file path if output is a file, empty string otherwise.
+// This is used to inject output context into prompts so agents know where their output will be saved.
+func getFileOutputPath(output interface{}) string {
+	outputStr, ok := output.(string)
+	if !ok {
+		return ""
+	}
+	outputStr = strings.TrimSpace(outputStr)
+
+	// Skip non-file outputs
+	if outputStr == "" ||
+		outputStr == OutputSTDOUT ||
+		strings.HasPrefix(outputStr, "MEMORY") ||
+		strings.HasPrefix(outputStr, "tool:") ||
+		strings.Contains(outputStr, "|") ||
+		strings.HasPrefix(outputStr, "$") {
+		return ""
+	}
+
+	return outputStr
 }

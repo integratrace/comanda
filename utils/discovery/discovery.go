@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
+	"github.com/kris-hansen/comanda/utils/models"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -17,6 +20,62 @@ type OllamaModel struct {
 	Name    string `json:"name"`
 	ModTime string `json:"modified_at"`
 	Size    int64  `json:"size"`
+}
+
+// CheckLlamaCPPInstalled checks if the llama.cpp CLI is installed and runnable.
+func CheckLlamaCPPInstalled() bool {
+	return models.IsLlamaCPPAvailable()
+}
+
+// GetLlamaCPPModels discovers GGUF models from LLAMA_CPP_MODEL_DIR or LLAMA_CPP_MODEL_DIRS.
+func GetLlamaCPPModels() ([]string, error) {
+	var roots []string
+
+	if single := strings.TrimSpace(os.Getenv("LLAMA_CPP_MODEL_DIR")); single != "" {
+		roots = append(roots, single)
+	}
+	if multi := strings.TrimSpace(os.Getenv("LLAMA_CPP_MODEL_DIRS")); multi != "" {
+		for _, root := range strings.Split(multi, string(os.PathListSeparator)) {
+			root = strings.TrimSpace(root)
+			if root != "" {
+				roots = append(roots, root)
+			}
+		}
+	}
+
+	if len(roots) == 0 {
+		return []string{}, nil
+	}
+
+	var modelsFound []string
+	seen := make(map[string]bool)
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(strings.ToLower(path), ".gguf") {
+				return nil
+			}
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				return err
+			}
+			if !seen[absPath] {
+				seen[absPath] = true
+				modelsFound = append(modelsFound, absPath)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error scanning GGUF models in %s: %v", root, err)
+		}
+	}
+
+	return modelsFound, nil
 }
 
 // GetOpenAIModels fetches the list of available models from the OpenAI API.
@@ -69,6 +128,12 @@ func GetDeepseekModels() []string {
 		"deepseek-vision",
 		"deepseek-reasoner",
 	}
+}
+
+// GetSakanaModels returns a hardcoded list of known Sakana models.
+func GetSakanaModels() []string {
+	registry := models.GetRegistry()
+	return registry.GetModels("sakana")
 }
 
 // GetGoogleModels returns a hardcoded list of known Google models.
@@ -139,8 +204,77 @@ func GetOllamaModels() ([]OllamaModel, error) {
 	return response.Models, nil
 }
 
+// VLLMModel represents a model available on the vLLM server
+type VLLMModel struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// CheckVLLMInstalled checks if the vLLM server is running and accessible.
+func CheckVLLMInstalled() bool {
+	endpoint := "http://localhost:8000"
+	// TODO: Support VLLM_ENDPOINT environment variable
+
+	resp, err := http.Get(endpoint + "/v1/models")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
+}
+
+// GetVLLMModels fetches the list of models available from the vLLM server.
+func GetVLLMModels() ([]VLLMModel, error) {
+	// Check if vLLM is running first
+	if !CheckVLLMInstalled() {
+		return nil, fmt.Errorf("vLLM server is not running or not accessible at http://localhost:8000")
+	}
+
+	endpoint := "http://localhost:8000"
+	resp, err := http.Get(endpoint + "/v1/models")
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to vLLM API: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("vLLM API error (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var response struct {
+		Data []VLLMModel `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("error decoding vLLM response: %v", err)
+	}
+
+	return response.Data, nil
+}
+
+// getCLIAgentModels returns the static model list for a CLI agent provider.
+// These mirror the models shown by `comanda configure --list`.
+func getCLIAgentModels(providerName string) ([]string, error) {
+	switch providerName {
+	case "claude-code":
+		return []string{"claude-code", "claude-code-opus", "claude-code-sonnet", "claude-code-haiku"}, nil
+	case "gemini-cli":
+		return []string{"gemini-cli", "gemini-cli-pro", "gemini-cli-flash", "gemini-cli-flash-lite"}, nil
+	case "openai-codex":
+		return models.GetOpenAICodexModels(), nil
+	case "kimi-code":
+		return []string{"kimi-code"}, nil
+	default:
+		return nil, fmt.Errorf("unknown CLI agent provider: %s", providerName)
+	}
+}
+
 // GetAvailableModels retrieves the list of available models for a given provider.
 // For providers like OpenAI and Ollama, it requires the API key or connection.
+// For CLI agents, it returns the static model list when the binary is detected.
 // For others, it returns a hardcoded list.
 func GetAvailableModels(providerName string, apiKey string) ([]string, error) {
 	switch providerName {
@@ -154,6 +288,8 @@ func GetAvailableModels(providerName string, apiKey string) ([]string, error) {
 		return GetXAIModels(), nil
 	case "deepseek":
 		return GetDeepseekModels(), nil
+	case "sakana":
+		return GetSakanaModels(), nil
 	case "ollama":
 		ollamaModels, err := GetOllamaModels()
 		if err != nil {
@@ -164,6 +300,20 @@ func GetAvailableModels(providerName string, apiKey string) ([]string, error) {
 			modelNames[i] = m.Name
 		}
 		return modelNames, nil
+	case "vllm":
+		vllmModels, err := GetVLLMModels()
+		if err != nil {
+			return nil, err
+		}
+		modelNames := make([]string, len(vllmModels))
+		for i, m := range vllmModels {
+			modelNames[i] = m.ID
+		}
+		return modelNames, nil
+	case "llama.cpp":
+		return GetLlamaCPPModels()
+	case "claude-code", "gemini-cli", "openai-codex", "kimi-code":
+		return getCLIAgentModels(providerName)
 	default:
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
 	}

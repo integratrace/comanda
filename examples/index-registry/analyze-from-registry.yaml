@@ -1,0 +1,26 @@
+# Example: Load codebase indexes from registry
+# 
+# Prerequisites:
+#   comanda index capture ~/path/to/project1 -n project1
+#   comanda index capture ~/path/to/project2 -n project2
+#
+# Usage:
+#   comanda process examples/index-registry/analyze-from-registry.yaml
+
+# Load a single index from registry
+load_single:
+  step_type: codebase-index
+  codebase_index:
+    use: comanda
+
+# Analyze the loaded codebase
+analyze:
+  input: |
+    Here is a codebase index:
+    
+    ${COMANDA_INDEX}
+    
+    Summarize the architecture and key components.
+  model: anthropic/claude-sonnet
+  action: Summarize the architecture and key components in the loaded registry index.
+  output: analysis.md

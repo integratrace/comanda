@@ -15,21 +15,26 @@ func TestSupportsModel(t *testing.T) {
 		// GPT models
 		{"gpt-4", "gpt-4", true},
 		{"gpt-3.5-turbo", "gpt-3.5-turbo", true},
-		
+		{"gpt-5.6 alias", "gpt-5.6", true},
+		{"gpt-5.6 Sol", "gpt-5.6-sol", true},
+		{"gpt-5.6 Terra", "gpt-5.6-terra", true},
+		{"gpt-5.6 Luna", "gpt-5.6-luna", true},
+		{"future dotted GPT-5 family", "gpt-5.7", true},
+
 		// O1 models
 		{"o1-pro", "o1-pro", true},
 		{"o1-pro-2025-03-19", "o1-pro-2025-03-19", true},
 		{"o1-preview", "o1-preview", true},
 		{"o1-preview-2024-09-12", "o1-preview-2024-09-12", true},
-		
+
 		// O3 models
 		{"o3-mini", "o3-mini", true},
 		{"o3-mini-2025-01-31", "o3-mini-2025-01-31", true},
-		
+
 		// O4 models
 		{"o4-mini", "o4-mini", true},
 		{"o4-mini-2025-04-16", "o4-mini-2025-04-16", true},
-		
+
 		// GPT-4O variants
 		{"gpt-4o-mini-realtime-preview", "gpt-4o-mini-realtime-preview", true},
 		{"gpt-4o-mini-search-preview", "gpt-4o-mini-search-preview", true},
@@ -39,7 +44,7 @@ func TestSupportsModel(t *testing.T) {
 		{"gpt-4o-mini-transcribe", "gpt-4o-mini-transcribe", true},
 		{"gpt-4.1-mini", "gpt-4.1-mini", true},
 		{"gpt-4.1-nano", "gpt-4.1-nano", true},
-		
+
 		// Invalid models
 		{"empty string", "", false},
 		{"invalid prefix", "invalid-model", false},
@@ -72,7 +77,8 @@ func TestIsNewModelSeries(t *testing.T) {
 		{"o1-preview", "o1-preview", true},
 		{"o3-mini", "o3-mini", true},
 		{"gpt-4o-mini", "gpt-4o-mini", true},
-		
+		{"gpt-5.6-sol", "gpt-5.6-sol", true},
+
 		// Legacy models
 		{"gpt-4", "gpt-4", false},
 		{"gpt-3.5-turbo", "gpt-3.5-turbo", false},
@@ -86,5 +92,17 @@ func TestIsNewModelSeries(t *testing.T) {
 				t.Errorf("isNewModelSeries(%q) = %v, want %v", tt.model, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestGPT56UsesReasoningModelTokenParameter(t *testing.T) {
+	provider := NewOpenAIProvider()
+	req := provider.createChatCompletionRequest("gpt-5.6-sol", nil)
+
+	if req.MaxCompletionTokens == 0 {
+		t.Fatal("GPT-5.6 request must use max_completion_tokens")
+	}
+	if req.MaxTokens != 0 {
+		t.Fatalf("GPT-5.6 request must not use legacy max_tokens; got %d", req.MaxTokens)
 	}
 }

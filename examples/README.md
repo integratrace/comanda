@@ -42,6 +42,48 @@ step_three:
   output: STDOUT
 ```
 
+### Multi-Agent Collaboration (`multi-agent/`)
+Examples demonstrating how to leverage Claude Code, Gemini CLI, and OpenAI Codex together:
+- `architecture-planning.yaml` - Parallel analysis with synthesis for comprehensive architecture design
+- `architecture-review.yaml` - Sequential refinement where each agent improves the previous work
+- `architecture-decision.yaml` - Voting/consensus pattern for specific architectural decisions
+
+```yaml
+# Example: Parallel multi-agent analysis
+parallel-process:
+  claude-analysis:
+    input: STDIN
+    model: claude-code
+    action: "Analyze system design aspects"
+    output: .comanda/claude-analysis.md
+
+  gemini-analysis:
+    input: STDIN
+    model: gemini-cli
+    action: "Analyze patterns and best practices"
+    output: .comanda/gemini-analysis.md
+
+  codex-analysis:
+    input: STDIN
+    model: openai-codex
+    action: "Analyze implementation structure"
+    output: .comanda/codex-analysis.md
+
+synthesize:
+  input:
+    - .comanda/claude-analysis.md
+    - .comanda/gemini-analysis.md
+    - .comanda/codex-analysis.md
+  model: claude-code
+  action: "Synthesize into unified recommendation"
+  output: STDOUT
+```
+
+Usage:
+```bash
+echo "Design a real-time collaborative editor" | comanda process multi-agent/architecture-planning.yaml
+```
+
 ### Server Examples (`server-examples/`)
 Examples demonstrating server functionality and STDIN input:
 - `stdin-example.yaml` - Shows STDIN input usage with server POST requests
@@ -91,10 +133,13 @@ docker run -d -p 5432:5432 comanda-postgres
 ### Model Examples (`model-examples/`)
 Examples demonstrating integration with different AI models:
 - `openai-example.yaml` - Basic OpenAI integration example
+- `gpt-5.6-example.yaml` - OpenAI GPT-5.6 Sol, Terra, and Luna via the Responses API
 - `ollama-example.yaml` - Using local Ollama models
 - `anthropic-pdf-example.yaml` - Using Anthropic's Claude model with PDF processing
 - `google-example.yaml` - Integration with Google's AI models
 - `xai-example.yaml` - X.AI model integration example
+- `grok-4-example.yaml` - X.AI Grok 4.5 and Grok 4.3 workflow
+- `sakana-example.yaml` - Sakana Fugu API integration example
 
 ### File Processing (`file-processing/`)
 Examples of file manipulation and processing:
@@ -124,6 +169,39 @@ Examples of working with various document formats:
 Examples of image-related operations:
 - `image-example.yaml` - Basic image processing capabilities
 - Supporting files: `image.jpeg`
+
+### Tool Use (`tool-use/`)
+Examples demonstrating shell command execution within workflows:
+- `tool-input-example.yaml` - Use shell commands as step input (`ls`, `find`, `date`)
+- `tool-output-example.yaml` - Pipe step output through commands (`jq`, `grep`, `awk`)
+- `beads-workflow-example.yaml` - Integration with the `bd` (beads) issue tracker
+- `beads-walkthrough.yaml` - Walkthrough: spec analysis → issue preview
+- `conveyor-belt-spec-to-beads.yaml` - Full automation: spec → bd create execution
+- `sample-spec.md` - Sample technical spec for testing
+
+```yaml
+# Example: Using tools in workflows
+list_issues:
+  input: "tool: bd list --json"
+  model: NA
+  action:
+    - Pass through the JSON data
+  output: STDOUT
+  tool:
+    allowlist: [bd]
+
+# Example: Pipe output through jq
+filter_json:
+  input: data.json
+  model: NA
+  action:
+    - Return the JSON
+  output: "tool: jq '.items[] | select(.active)'"
+  tool:
+    allowlist: [jq]
+```
+
+**Security:** Tool execution is controlled by allowlist/denylist. Safe commands like `ls`, `grep`, `jq`, `bd` are allowed by default. Dangerous commands like `rm`, `sudo`, `curl` are blocked.
 
 ## Running Examples
 
@@ -158,22 +236,41 @@ Each example includes comments explaining its functionality and any specific req
    - `model-examples/anthropic-pdf-example.yaml` (PDF processing)
    - `model-examples/google-example.yaml` (Google AI integration)
    - `model-examples/xai-example.yaml` (X.AI integration)
+   - `model-examples/sakana-example.yaml` (Sakana Fugu integration)
 
-4. **Data Examples**: Demonstrate data processing capabilities
+4. **Multi-Agent Examples**: Combine multiple agentic coding tools
+   - `multi-agent/architecture-planning.yaml` (parallel analysis + synthesis)
+   - `multi-agent/architecture-review.yaml` (sequential refinement)
+   - `multi-agent/architecture-decision.yaml` (voting/consensus ADRs)
+
+5. **Data Examples**: Demonstrate data processing capabilities
    - `database-connections/postgres/db-example.yaml` (database operations)
    - `parallel-processing/parallel-data-processing.yaml` (parallel data analysis)
 
-5. **Server Examples**: Show HTTP server functionality
+6. **Server Examples**: Show HTTP server functionality
    - `server-examples/stdin-example.yaml` (POST request with string input)
    ```bash
    # Check if YAML supports POST
    curl "http://localhost:8080/list"
-   
+
    # Process with POST if supported
    curl -X POST \
      -H "Content-Type: application/json" \
      -d '{"input":"analyze this text"}' \
      "http://localhost:8080/process?filename=server-examples/stdin-example.yaml"
+   ```
+
+7. **Tool Use Examples**: Execute shell commands in workflows
+   - `tool-use/tool-input-example.yaml` (use commands as input)
+   - `tool-use/tool-output-example.yaml` (pipe output through commands)
+   - `tool-use/beads-workflow-example.yaml` (integrate with external CLIs)
+   - `tool-use/beads-walkthrough.yaml` (spec → issues workflow)
+
+8. **MCP Examples**: Serve workflows as MCP tools for agent clients
+   - `mcp/echo.yaml` (no provider needed, good first smoke test)
+   - `mcp/summarize.yaml` (variable substitution via tool arguments)
+   ```bash
+   comanda mcp --workflow examples/mcp/echo.yaml
    ```
 
 ### Test Environment

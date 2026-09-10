@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kris-hansen/comanda/utils/fileutil"
@@ -21,6 +23,7 @@ type OpenAIProvider struct {
 	apiKey  string
 	config  ModelConfig
 	verbose bool
+	mu      sync.Mutex
 }
 
 // NewOpenAIProvider creates a new OpenAI provider instance
@@ -40,10 +43,12 @@ func (o *OpenAIProvider) Name() string {
 	return "openai"
 }
 
-// debugf prints debug information if verbose mode is enabled
+// debugf prints debug information if verbose mode is enabled (thread-safe)
 func (o *OpenAIProvider) debugf(format string, args ...interface{}) {
 	if o.verbose {
-		fmt.Printf("[DEBUG][OpenAI] "+format+"\n", args...)
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		log.Printf("[DEBUG][OpenAI] "+format+"\n", args...)
 	}
 }
 
@@ -65,14 +70,15 @@ func (o *OpenAIProvider) SupportsModel(modelName string) bool {
 	// Only match well-known OpenAI model patterns
 	openaiPatterns := []string{
 		"gpt-3.5-turbo",
-		"gpt-3.5-",    // gpt-3.5 variants  
+		"gpt-3.5-", // gpt-3.5 variants
 		"gpt-4-turbo",
-		"gpt-4o-",     // gpt-4o variants
+		"gpt-4o-", // gpt-4o variants
 		"gpt-4.1",
-		"gpt-5-",      // gpt-5 variants like gpt-5-mini, gpt-5-nano
-		"o1-",         // o1 variants
-		"o3-",         // o3 variants  
-		"o4-",         // o4 variants
+		"gpt-5-", // gpt-5 variants like gpt-5-mini, gpt-5-nano
+		"gpt-5.", // versioned GPT-5 families like gpt-5.6-sol
+		"o1-",    // o1 variants
+		"o3-",    // o3 variants
+		"o4-",    // o4 variants
 		"chatgpt-4o-",
 	}
 
@@ -107,13 +113,16 @@ func (o *OpenAIProvider) Configure(apiKey string) error {
 	return nil
 }
 
-// isNewModelSeries checks if the model is part of the newer series (4o, o1, o3, o4)
+// isNewModelSeries checks if the model is part of the newer series (4o, o1, o3, o4, gpt-5)
 func (o *OpenAIProvider) isNewModelSeries(modelName string) bool {
 	modelName = strings.ToLower(modelName)
-	return strings.Contains(modelName, "gpt-4o") ||
+	isNew := strings.Contains(modelName, "gpt-4o") ||
 		strings.HasPrefix(modelName, "o1") || // Covers o1, o1-pro, o1-mini
 		strings.HasPrefix(modelName, "o3") || // Covers o3, o3-pro, o3-mini
-		strings.HasPrefix(modelName, "o4-") // Covers o4-mini series
+		strings.HasPrefix(modelName, "o4-") || // Covers o4-mini series
+		strings.HasPrefix(modelName, "gpt-5") // Covers gpt-5 and variants
+	o.debugf("Model %s isNewModelSeries: %v", modelName, isNew)
+	return isNew
 }
 
 // createChatCompletionRequest creates a ChatCompletionRequest with the appropriate parameters
@@ -146,6 +155,7 @@ func (o *OpenAIProvider) createChatCompletionRequest(modelName string, messages 
 func (o *OpenAIProvider) SendPrompt(modelName string, prompt string) (string, error) {
 	o.debugf("Preparing to send prompt to model: %s", modelName)
 	o.debugf("Prompt length: %d characters", len(prompt))
+	o.debugf("About to call isNewModelSeries for: %s", modelName)
 
 	if o.apiKey == "" {
 		return "", fmt.Errorf("OpenAI provider not configured: missing API key")

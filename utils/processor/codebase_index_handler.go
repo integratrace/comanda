@@ -1,0 +1,369 @@
+package processor
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/kris-hansen/comanda/utils/codebaseindex"
+	"github.com/kris-hansen/comanda/utils/fileutil"
+	"github.com/kris-hansen/comanda/utils/models"
+)
+
+// processCodebaseIndexStep handles the codebase-index step type
+func (p *Processor) processCodebaseIndexStep(step Step, isParallel bool, parallelID string) (string, error) {
+	p.debugf("Processing codebase-index step: %s", step.Name)
+
+	ci := step.Config.CodebaseIndex
+	if ci == nil {
+		ci = &CodebaseIndexConfig{}
+	}
+
+	// Check if we're loading from registry
+	if ci.Use != nil {
+		return p.processCodebaseIndexFromRegistry(step, ci)
+	}
+
+	// Otherwise, generate fresh index
+	return p.processCodebaseIndexGenerate(step)
+}
+
+// processCodebaseIndexFromRegistry loads indexes from the registry
+func (p *Processor) processCodebaseIndexFromRegistry(step Step, ci *CodebaseIndexConfig) (string, error) {
+	// Parse 'use' field - can be string or []string
+	var names []string
+	switch v := ci.Use.(type) {
+	case string:
+		names = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				names = append(names, s)
+			}
+		}
+	case []string:
+		names = v
+	default:
+		return "", fmt.Errorf("invalid 'use' field type: expected string or []string")
+	}
+
+	if len(names) == 0 {
+		return "", fmt.Errorf("'use' field is empty")
+	}
+
+	// Check for registered indexes in envConfig
+	if p.envConfig == nil || p.envConfig.Indexes == nil {
+		return "", fmt.Errorf("no indexes registered (run 'comanda index capture' first)")
+	}
+
+	var allContent []string
+	var loadedIndexes []string
+
+	for _, name := range names {
+		entry, ok := p.envConfig.Indexes[name]
+		if !ok {
+			return "", fmt.Errorf("index '%s' not found in registry", name)
+		}
+
+		// Check max_age if specified
+		if ci.MaxAge != "" {
+			maxAge, err := time.ParseDuration(ci.MaxAge)
+			if err != nil {
+				p.debugf("Warning: invalid max_age '%s': %v", ci.MaxAge, err)
+			} else {
+				if t, err := time.Parse(time.RFC3339, entry.LastIndexed); err == nil {
+					age := time.Since(t)
+					if age > maxAge {
+						p.debugf("Warning: index '%s' is stale (age: %v, max: %v)", name, age, maxAge)
+					}
+				}
+			}
+		}
+
+		// Load index content
+		content, err := os.ReadFile(entry.IndexPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read index '%s' from %s: %w", name, entry.IndexPath, err)
+		}
+
+		// Handle encrypted indexes
+		if entry.Encrypted {
+			key := os.Getenv("COMANDA_INDEX_KEY")
+			if key == "" && p.envConfig != nil {
+				key = p.envConfig.IndexEncryptionKey
+			}
+			if key == "" {
+				return "", fmt.Errorf("index '%s' is encrypted but no decryption key provided", name)
+			}
+			decrypted, err := codebaseindex.Decrypt(content, key)
+			if err != nil {
+				return "", fmt.Errorf("failed to decrypt index '%s': %w", name, err)
+			}
+			content = decrypted
+		}
+
+		contentStr := string(content)
+
+		// Export as individual variable
+		p.variables[entry.VarPrefix+"_INDEX"] = contentStr
+		p.variables[entry.VarPrefix+"_INDEX_PATH"] = entry.IndexPath
+
+		allContent = append(allContent, contentStr)
+		loadedIndexes = append(loadedIndexes, name)
+
+		p.debugf("Loaded index '%s' from registry (%d bytes)", name, len(content))
+	}
+
+	// If aggregate mode, also create combined variable
+	if ci.Aggregate && len(allContent) > 1 {
+		var aggregated string
+		if ci.Compress {
+			aggregated = codebaseindex.CompressAggregatedContent(allContent)
+			p.debugf("Created compressed AGGREGATED_INDEX from %d indexes", len(allContent))
+		} else {
+			aggregated = strings.Join(allContent, "\n\n---\n\n")
+			p.debugf("Created AGGREGATED_INDEX from %d indexes", len(allContent))
+		}
+		p.variables["AGGREGATED_INDEX"] = aggregated
+	}
+
+	return fmt.Sprintf("Loaded %d index(es) from registry: %v", len(loadedIndexes), loadedIndexes), nil
+}
+
+// processCodebaseIndexGenerate generates a fresh index
+func (p *Processor) processCodebaseIndexGenerate(step Step) (string, error) {
+	// Build configuration from step config
+	config, err := p.buildCodebaseIndexConfigWithError(step.Config)
+	if err != nil {
+		return "", err
+	}
+
+	// Create manager
+	manager, err := codebaseindex.NewManager(config, p.verbose)
+	if err != nil {
+		return "", fmt.Errorf("failed to create codebase index manager: %w", err)
+	}
+
+	// Generate the index
+	result, err := manager.Generate()
+	if err != nil {
+		return "", fmt.Errorf("codebase index generation failed: %w", err)
+	}
+
+	// Export workflow variables
+	cfg := manager.GetConfig()
+	varPrefix := cfg.RepoVarSlug
+
+	// Main index content
+	p.variables[varPrefix+"_INDEX"] = result.Content
+
+	// Index path
+	p.variables[varPrefix+"_INDEX_PATH"] = result.OutputPath
+
+	// Content hash
+	p.variables[varPrefix+"_INDEX_SHA"] = result.ContentHash
+
+	// Updated flag
+	if result.Updated {
+		p.variables[varPrefix+"_INDEX_UPDATED"] = "true"
+	} else {
+		p.variables[varPrefix+"_INDEX_UPDATED"] = "false"
+	}
+
+	p.debugf("Codebase index generated: %d files indexed, output at %s", result.FileCount, result.OutputPath)
+	p.debugf("Exported variables: %s_INDEX, %s_INDEX_PATH, %s_INDEX_SHA, %s_INDEX_UPDATED", varPrefix, varPrefix, varPrefix, varPrefix)
+
+	// Return summary message
+	return fmt.Sprintf("Codebase index generated successfully.\nLanguages: %v\nFiles indexed: %d\nOutput: %s\nDuration: %v",
+		result.Languages, result.FileCount, result.OutputPath, result.Duration), nil
+}
+
+// buildCodebaseIndexConfig converts processor config to codebaseindex.Config.
+// It preserves the historical test helper signature; runtime code should call
+// buildCodebaseIndexConfigWithError so explicit enhancement failures are not
+// silently ignored.
+func (p *Processor) buildCodebaseIndexConfig(stepConfig StepConfig) *codebaseindex.Config {
+	config, _ := p.buildCodebaseIndexConfigWithError(stepConfig)
+	return config
+}
+
+func (p *Processor) buildCodebaseIndexConfigWithError(stepConfig StepConfig) (*codebaseindex.Config, error) {
+	config := codebaseindex.DefaultConfig()
+	requestedRoot := ""
+	if stepConfig.CodebaseIndex != nil {
+		requestedRoot = stepConfig.CodebaseIndex.Root
+	}
+	root, err := p.resolveCodebaseIndexRoot(requestedRoot)
+	if err != nil {
+		return nil, err
+	}
+	config.Root = root
+
+	// Use step-level config if available
+	if stepConfig.CodebaseIndex != nil {
+		ci := stepConfig.CodebaseIndex
+
+		if ci.Output != nil {
+			if ci.Output.Path != "" {
+				// Expand ~ in output path
+				expandedOutput, err := fileutil.ExpandPath(ci.Output.Path)
+				if err != nil {
+					p.debugf("Warning: failed to expand output path %s: %v", ci.Output.Path, err)
+					config.OutputPath = ci.Output.Path // Fall back to unexpanded path
+				} else {
+					config.OutputPath = expandedOutput
+				}
+			}
+			if ci.Output.Format != "" {
+				switch ci.Output.Format {
+				case "summary":
+					config.OutputFormat = codebaseindex.FormatSummary
+				case "structured":
+					config.OutputFormat = codebaseindex.FormatStructured
+				case "full":
+					config.OutputFormat = codebaseindex.FormatFull
+				default:
+					config.OutputFormat = codebaseindex.FormatStructured
+				}
+			}
+			if ci.Output.Store != "" {
+				switch ci.Output.Store {
+				case "repo":
+					config.Store = codebaseindex.StoreRepo
+				case "config":
+					config.Store = codebaseindex.StoreConfig
+				case "both":
+					config.Store = codebaseindex.StoreBoth
+				}
+			}
+			config.Encrypt = ci.Output.Encrypt
+			// Get encryption key: env var takes precedence, then config
+			if ci.Output.Encrypt {
+				config.EncryptionKey = os.Getenv("COMANDA_INDEX_KEY")
+				if config.EncryptionKey == "" && p.envConfig != nil {
+					config.EncryptionKey = p.envConfig.IndexEncryptionKey
+				}
+			}
+		}
+
+		if ci.Expose != nil {
+			config.ExposeVariable = ci.Expose.WorkflowVariable
+			if ci.Expose.Memory != nil {
+				config.MemoryEnabled = ci.Expose.Memory.Enabled
+				config.MemoryKey = ci.Expose.Memory.Key
+			}
+		}
+
+		if ci.MaxOutputKB > 0 {
+			config.MaxOutputKB = ci.MaxOutputKB
+		}
+
+		if ci.MaxFiles != nil {
+			config.MaxFiles = *ci.MaxFiles
+		}
+
+		if ci.Enhance {
+			modelName, enhanceFunc, err := p.buildCodebaseIndexEnhancer(ci.EnhanceModel)
+			if err != nil {
+				return nil, fmt.Errorf("failed to configure codebase index enhancement: %w", err)
+			}
+			config.EnhanceIndex = true
+			config.EnhancementModel = modelName
+			config.EnhancementFunc = enhanceFunc
+		}
+
+		// Convert adapter overrides
+		if len(ci.Adapters) > 0 {
+			config.AdapterOverrides = make(map[string]*codebaseindex.AdapterOverride)
+			for name, override := range ci.Adapters {
+				config.AdapterOverrides[name] = &codebaseindex.AdapterOverride{
+					IgnoreDirs:      override.IgnoreDirs,
+					IgnoreGlobs:     override.IgnoreGlobs,
+					PriorityFiles:   override.PriorityFiles,
+					ReplaceDefaults: override.ReplaceDefaults,
+				}
+			}
+		}
+
+		if len(ci.ParserPlugins) > 0 {
+			config.ParserPlugins = append([]codebaseindex.ParserPluginConfig(nil), ci.ParserPlugins...)
+		}
+
+		// Convert qmd integration config
+		if ci.Qmd != nil {
+			config.Qmd = &codebaseindex.QmdConfig{
+				Collection:   ci.Qmd.Collection,
+				Embed:        ci.Qmd.Embed,
+				Context:      ci.Qmd.Context,
+				Mask:         ci.Qmd.Mask,
+				Quantize:     ci.Qmd.Quantize,
+				QuantizeBits: ci.Qmd.QuantizeBits,
+			}
+		}
+	}
+
+	config.Verbose = p.verbose
+
+	return config, nil
+}
+
+// Index roots are source locations, not runtime output paths. A request's
+// runtimeDir must never expand the set of repositories it may index.
+func (p *Processor) resolveCodebaseIndexRoot(requested string) (string, error) {
+	if requested == "" {
+		requested = "."
+	}
+	if p.sourceRoot != "" {
+		return ResolveProjectPath(p.sourceRoot, requested)
+	}
+	// Enabled controls authentication; a server with authentication disabled
+	// still has a configured data directory and needs the same confinement.
+	if p.serverConfig != nil && (p.serverConfig.Enabled || p.serverConfig.DataDir != "") {
+		if p.serverConfig.DataDir == "" {
+			return "", fmt.Errorf("codebase indexing requires a server data directory or a selected project")
+		}
+		base, err := filepath.Abs(p.serverConfig.DataDir)
+		if err != nil {
+			return "", fmt.Errorf("resolve server data directory: %w", err)
+		}
+		return ResolveProjectPath(base, requested)
+	}
+	return fileutil.ExpandPath(requested)
+}
+
+func (p *Processor) buildCodebaseIndexEnhancer(requestedModel string) (string, func(string) (string, error), error) {
+	if p.envConfig == nil {
+		return "", nil, fmt.Errorf("enhance requires environment configuration")
+	}
+
+	modelName := requestedModel
+	if modelName == "" {
+		modelName = p.envConfig.DefaultGenerationModel
+	}
+	if modelName == "" {
+		return "", nil, fmt.Errorf("enhance requires default_generation_model or codebase_index.enhance_model")
+	}
+
+	resolvedModel := p.resolveModelTarget(modelName)
+	provider := models.DetectProvider(resolvedModel)
+	if provider == nil {
+		return "", nil, fmt.Errorf("could not detect provider for enhancement model %q", modelName)
+	}
+
+	providerName := provider.Name()
+	isCLIAgent := providerName == "claude-code" || providerName == "gemini-cli" || providerName == "openai-codex" || providerName == "kimi-code"
+	if providerConfig, err := p.envConfig.GetProviderConfig(providerName); err == nil {
+		if err := provider.Configure(providerConfig.APIKey); err != nil {
+			return "", nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+		}
+	} else if !isCLIAgent {
+		return "", nil, fmt.Errorf("provider %s not configured: %w", providerName, err)
+	}
+	provider.SetVerbose(p.verbose)
+
+	return modelName, func(prompt string) (string, error) {
+		return provider.SendPrompt(resolvedModel, prompt)
+	}, nil
+}

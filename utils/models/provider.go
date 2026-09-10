@@ -49,6 +49,22 @@ type Provider interface {
 	SetVerbose(verbose bool)
 }
 
+// SystemPrompter is an optional Provider capability for backends that accept a
+// system prompt separate from the user prompt. Standard steps use it when
+// StepConfig.Instructions is set; providers that do not implement it fall back
+// to the plain SendPrompt/SendPromptWithFile calls.
+type SystemPrompter interface {
+	SendPromptWithSystem(modelName string, system string, prompt string) (string, error)
+	SendPromptWithFileAndSystem(modelName string, system string, prompt string, file FileInput) (string, error)
+}
+
+// ModelConfigurer is an optional Provider capability for backends that accept
+// per-call generation settings. Standard steps apply it when a step sets
+// temperature, max_output_tokens, or top_p.
+type ModelConfigurer interface {
+	SetConfig(config ModelConfig)
+}
+
 // ResponsesStreamHandler defines callbacks for streaming responses
 type ResponsesStreamHandler interface {
 	OnResponseCreated(response map[string]interface{})
@@ -64,6 +80,29 @@ type ResponsesProvider interface {
 	Provider
 	SendPromptWithResponses(config ResponsesConfig) (string, error)
 	SendPromptWithResponsesStream(config ResponsesConfig, handler ResponsesStreamHandler) error
+}
+
+// AgenticProvider extends Provider for CLI-based providers that can run prompts
+// with full tool access (file edits, shell commands) for agentic mode.
+// allowedPaths scopes the agent's workspace access; tools is a provider-specific
+// tool allowlist (providers without per-tool granularity may ignore it);
+// workDir is the working directory for the subprocess.
+type AgenticProvider interface {
+	Provider
+	SendPromptAgentic(modelName string, prompt string, allowedPaths []string, tools []string, workDir string) (string, error)
+}
+
+// DebugFileSetter is an optional AgenticProvider capability for providers that
+// can stream debug output to a file (watched by the processor's DebugWatcher).
+type DebugFileSetter interface {
+	SetDebugFile(path string)
+}
+
+// WorktreeSetter is an optional AgenticProvider capability for providers that
+// support isolated execution in a git worktree.
+type WorktreeSetter interface {
+	SetWorktree(name string)
+	ClearWorktree()
 }
 
 // OllamaTagsResponse represents the response from Ollama's /api/tags endpoint
@@ -111,13 +150,13 @@ func isModelAvailableLocally(modelName string) bool {
 	modelNameLower := strings.ToLower(modelName)
 	for _, model := range tagsResponse.Models {
 		modelFullName := strings.ToLower(model.Name)
-		
+
 		// First check exact match
 		if modelFullName == modelNameLower {
 			config.DebugLog("[Provider] Found local model (exact match): %s", modelName)
 			return true
 		}
-		
+
 		// Then check if the requested model matches the base name (before :tag)
 		// e.g., "gpt-oss" should match "gpt-oss:latest"
 		if strings.Contains(modelFullName, ":") {
@@ -127,9 +166,9 @@ func isModelAvailableLocally(modelName string) bool {
 				return true
 			}
 		}
-		
+
 		// Also check if the full model name starts with the requested name
-		// e.g., "llama3" should match "llama3.2:latest" 
+		// e.g., "llama3" should match "llama3.2:latest"
 		if strings.HasPrefix(modelFullName, modelNameLower) {
 			// Make sure we're not matching partial names unintentionally
 			nextChar := modelFullName[len(modelNameLower):]
@@ -144,6 +183,75 @@ func isModelAvailableLocally(modelName string) bool {
 	return false
 }
 
+// VLLMModelsResponse represents the response from vLLM's /v1/models endpoint
+type VLLMModelsResponse struct {
+	Data []VLLMModelInfo `json:"data"`
+}
+
+// VLLMModelInfo represents a single model from vLLM
+type VLLMModelInfo struct {
+	ID string `json:"id"`
+}
+
+// isModelAvailableOnVLLM checks if a model is available on the local vLLM instance
+func isModelAvailableOnVLLM(modelName string) bool {
+	// Get vLLM endpoint from environment or use default
+	endpoint := "http://localhost:8000"
+	// Note: endpoint customization can be done via VLLM_ENDPOINT environment variable
+	// which is read in the VLLMProvider itself
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(endpoint + "/v1/models")
+	if err != nil {
+		config.DebugLog("[Provider] Failed to connect to vLLM: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		config.DebugLog("[Provider] vLLM API returned status %d", resp.StatusCode)
+		return false
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		config.DebugLog("[Provider] Failed to read vLLM response: %v", err)
+		return false
+	}
+
+	var modelsResponse VLLMModelsResponse
+	if err := json.Unmarshal(body, &modelsResponse); err != nil {
+		config.DebugLog("[Provider] Failed to parse vLLM response: %v", err)
+		return false
+	}
+
+	modelNameLower := strings.ToLower(modelName)
+	for _, model := range modelsResponse.Data {
+		modelIDLower := strings.ToLower(model.ID)
+
+		// Check for exact match
+		if modelIDLower == modelNameLower {
+			config.DebugLog("[Provider] Found vLLM model (exact match): %s", modelName)
+			return true
+		}
+	}
+
+	config.DebugLog("[Provider] Model %s not found on vLLM server", modelName)
+	return false
+}
+
+func isLlamaCPPModelAvailable(modelName string) bool {
+	provider := NewLlamaCPPProvider()
+	if !provider.SupportsModel(modelName) {
+		return false
+	}
+	if _, err := provider.resolveModelPath(modelName); err != nil {
+		config.DebugLog("[Provider] llama.cpp model not available: %v", err)
+		return false
+	}
+	return true
+}
+
 // DetectProviderFunc is the type for the provider detection function
 type DetectProviderFunc func(modelName string) Provider
 
@@ -154,8 +262,10 @@ var DetectProvider DetectProviderFunc = defaultDetectProvider
 func defaultDetectProvider(modelName string) Provider {
 	config.DebugLog("[Provider] Attempting to detect provider for model: %s", modelName)
 
-	// First, check if the model is available locally via Ollama
+	// First, check local providers (Ollama and vLLM)
 	// This prioritizes local models over third-party providers
+
+	// Check Ollama
 	ollamaProvider := NewOllamaProvider()
 	if ollamaProvider.SupportsModel(modelName) {
 		// Check if the model actually exists locally
@@ -165,6 +275,96 @@ func defaultDetectProvider(modelName string) Provider {
 		}
 	}
 
+	// Check vLLM
+	vllmProvider := NewVLLMProvider()
+	if vllmProvider.SupportsModel(modelName) {
+		// Check if the model actually exists on vLLM server
+		if isModelAvailableOnVLLM(modelName) {
+			config.DebugLog("[Provider] Found local vLLM provider for model %s", modelName)
+			return vllmProvider
+		}
+	}
+
+	// Check llama.cpp
+	llamaCPPProvider := NewLlamaCPPProvider()
+	if llamaCPPProvider.SupportsModel(modelName) {
+		if !IsLlamaCPPAvailable() {
+			config.DebugLog("[Provider] Model %s requires llama.cpp but llama-cli was not found", modelName)
+			return nil
+		}
+		if isLlamaCPPModelAvailable(modelName) {
+			config.DebugLog("[Provider] Found local llama.cpp provider for model %s", modelName)
+			return llamaCPPProvider
+		}
+		config.DebugLog("[Provider] Model %s looks like llama.cpp/GGUF but the file was not found", modelName)
+		return nil
+	}
+
+	// Check Claude Code (local CLI)
+	claudeCodeProvider := NewClaudeCodeProvider()
+	if claudeCodeProvider.SupportsModel(modelName) {
+		// Check if the claude binary is available
+		if IsClaudeCodeAvailable() {
+			config.DebugLog("[Provider] Found local Claude Code provider for model %s", modelName)
+			return claudeCodeProvider
+		}
+		// Model is a claude-code model but binary not found - return nil to give clear error
+		// rather than falling through to Ollama which would give a confusing error
+		config.DebugLog("[Provider] Model %s requires Claude Code CLI but 'claude' binary not found in PATH", modelName)
+		return nil
+	}
+
+	// Check Gemini CLI (local CLI)
+	geminiCLIProvider := NewGeminiCLIProvider()
+	if geminiCLIProvider.SupportsModel(modelName) {
+		// Check if the gemini binary is available
+		if IsGeminiCLIAvailable() {
+			config.DebugLog("[Provider] Found local Gemini CLI provider for model %s", modelName)
+			return geminiCLIProvider
+		}
+		// Model is a gemini-cli model but binary not found - return nil to give clear error
+		config.DebugLog("[Provider] Model %s requires Gemini CLI but 'gemini' binary not found in PATH", modelName)
+		return nil
+	}
+
+	// Check OpenAI Codex (local CLI)
+	openaiCodexProvider := NewOpenAICodexProvider()
+	if openaiCodexProvider.SupportsModel(modelName) {
+		// Check if the codex binary is available
+		if IsOpenAICodexAvailable() {
+			config.DebugLog("[Provider] Found local OpenAI Codex provider for model %s", modelName)
+			return openaiCodexProvider
+		}
+		// Model is an openai-codex model but binary not found - return nil to give clear error
+		config.DebugLog("[Provider] Model %s requires OpenAI Codex CLI but 'codex' binary not found in PATH", modelName)
+		return nil
+	}
+
+	// Check Kimi Code (local CLI)
+	kimiCodeProvider := NewKimiCodeProvider()
+	if kimiCodeProvider.SupportsModel(modelName) {
+		// Check if the kimi binary is available
+		if IsKimiCodeAvailable() {
+			config.DebugLog("[Provider] Found local Kimi Code provider for model %s", modelName)
+			return kimiCodeProvider
+		}
+		// Model is a kimi-code model but binary not found - return nil to give clear error
+		config.DebugLog("[Provider] Model %s requires Kimi Code CLI but 'kimi' binary not found in PATH", modelName)
+		return nil
+	}
+
+	// Check AWS Bedrock (explicit bedrock/ prefix)
+	bedrockProvider := NewBedrockProvider()
+	if bedrockProvider.SupportsModel(modelName) {
+		// Check if AWS credentials are available
+		if IsBedrockAvailable() {
+			config.DebugLog("[Provider] Found Bedrock provider for model %s", modelName)
+			return bedrockProvider
+		}
+		config.DebugLog("[Provider] Model %s requires AWS Bedrock but credentials not configured", modelName)
+		return nil
+	}
+
 	// Order third-party providers from most specific to most general
 	providers := []Provider{
 		NewGoogleProvider(),    // Handles gemini- models
@@ -172,6 +372,7 @@ func defaultDetectProvider(modelName string) Provider {
 		NewXAIProvider(),       // Handles grok- models
 		NewDeepseekProvider(),  // Handles deepseek- models
 		NewMoonshotProvider(),  // Handles moonshot- models
+		NewSakanaProvider(),    // Handles fugu models
 		NewOpenAIProvider(),    // Handles gpt- models
 	}
 
