@@ -141,7 +141,14 @@ func (b *BedrockProvider) SendPromptWithSystem(modelName string, system string, 
 	inferenceConfig := &types.InferenceConfiguration{
 		MaxTokens:   aws.Int32(int32(b.config.MaxTokens)),
 		Temperature: aws.Float32(float32(b.config.Temperature)),
-		TopP:        aws.Float32(float32(b.config.TopP)),
+	}
+	// Anthropic models on Converse reject temperature and top_p together.
+	// top_p 1.0 (the provider default) is a no-op, so only send it when a
+	// caller explicitly configured something else - and then let it replace
+	// temperature, which is what the model API permits.
+	if b.config.TopP != 0 && b.config.TopP != 1.0 {
+		inferenceConfig.Temperature = nil
+		inferenceConfig.TopP = aws.Float32(float32(b.config.TopP))
 	}
 
 	// Call Converse API
@@ -266,7 +273,14 @@ func (b *BedrockProvider) SendPromptWithFileAndSystem(modelName string, system s
 	inferenceConfig := &types.InferenceConfiguration{
 		MaxTokens:   aws.Int32(int32(b.config.MaxTokens)),
 		Temperature: aws.Float32(float32(b.config.Temperature)),
-		TopP:        aws.Float32(float32(b.config.TopP)),
+	}
+	// Anthropic models on Converse reject temperature and top_p together.
+	// top_p 1.0 (the provider default) is a no-op, so only send it when a
+	// caller explicitly configured something else - and then let it replace
+	// temperature, which is what the model API permits.
+	if b.config.TopP != 0 && b.config.TopP != 1.0 {
+		inferenceConfig.Temperature = nil
+		inferenceConfig.TopP = aws.Float32(float32(b.config.TopP))
 	}
 
 	input := &bedrockruntime.ConverseInput{
