@@ -2413,6 +2413,9 @@ func (p *Processor) getProviderForModel(modelName string) (models.Provider, erro
 		if err := newProvider.Configure(apiKey); err != nil {
 			return nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 		}
+		if providerConfig != nil {
+			models.ApplyBaseURL(newProvider, providerConfig.BaseURL)
+		}
 		newProvider.SetVerbose(p.verbose)
 		p.providers[providerName] = newProvider
 	}

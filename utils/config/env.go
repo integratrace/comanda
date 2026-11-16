@@ -55,6 +55,7 @@ type Model struct {
 // Provider represents a provider's configuration
 type Provider struct {
 	APIKey            string  `yaml:"api_key"`
+	BaseURL           string  `yaml:"base_url,omitempty"` // openai only: OpenAI-compatible gateway URL
 	Models            []Model `yaml:"models"`
 	SupportsWorktrees bool    `yaml:"supports_worktrees,omitempty"`
 }

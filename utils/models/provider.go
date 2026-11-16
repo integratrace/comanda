@@ -65,6 +65,13 @@ type ModelConfigurer interface {
 	SetConfig(config ModelConfig)
 }
 
+// ApplyBaseURL sets a configured base URL on providers that accept one (openai).
+func ApplyBaseURL(p Provider, baseURL string) {
+	if s, ok := p.(interface{ SetBaseURL(string) }); ok {
+		s.SetBaseURL(baseURL)
+	}
+}
+
 // ResponsesStreamHandler defines callbacks for streaming responses
 type ResponsesStreamHandler interface {
 	OnResponseCreated(response map[string]interface{})

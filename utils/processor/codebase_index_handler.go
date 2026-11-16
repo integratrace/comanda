@@ -358,6 +358,7 @@ func (p *Processor) buildCodebaseIndexEnhancer(requestedModel string) (string, f
 		if err := provider.Configure(providerConfig.APIKey); err != nil {
 			return "", nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 		}
+		models.ApplyBaseURL(provider, providerConfig.BaseURL)
 	} else if !isCLIAgent {
 		return "", nil, fmt.Errorf("provider %s not configured: %w", providerName, err)
 	}
