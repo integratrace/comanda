@@ -158,6 +158,18 @@ See [GitHub Releases](https://github.com/kris-hansen/comanda/releases) for prebu
 - Call OpenAI, Anthropic, Google, xAI, DeepSeek, Moonshot, Sakana, Ollama, vLLM, llama.cpp, and compatible providers
 - Run workflows as HTTP endpoints or OpenAI-compatible server routes
 
+## OpenAI-compatible gateway
+
+The `openai` provider takes an optional `base_url`. Comanda sends chat and responses calls there instead of `https://api.openai.com/v1`. Precedence: provider `base_url` in the config file, then the `OPENAI_BASE_URL` environment variable, then the OpenAI default. Model listing in `comanda configure` still calls OpenAI.
+
+```yaml
+# ~/.comanda/config.yaml
+providers:
+  openai:
+    api_key: <gateway key>
+    base_url: http://agentgateway.agentgateway-system.svc/v1
+```
+
 ## Durable Semantic Memory
 
 Comanda has two complementary memory modes:

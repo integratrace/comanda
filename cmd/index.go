@@ -460,6 +460,8 @@ func buildIndexEnhancer(requestedModel string) (string, func(string) (string, er
 		}
 	} else if err := provider.Configure(providerConfig.APIKey); err != nil {
 		return "", nil, fmt.Errorf("failed to configure provider %s: %w", providerName, err)
+	} else {
+		models.ApplyBaseURL(provider, providerConfig.BaseURL)
 	}
 	provider.SetVerbose(verbose)
 

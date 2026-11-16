@@ -224,6 +224,7 @@ overridden with --model.`,
 			if err := provider.Configure(providerConfig.APIKey); err != nil {
 				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 			}
+			models.ApplyBaseURL(provider, providerConfig.BaseURL)
 		}
 		provider.SetVerbose(verbose)
 
@@ -437,6 +438,7 @@ overridden with --model.`,
 			if err := provider.Configure(providerConfig.APIKey); err != nil {
 				return fmt.Errorf("failed to configure provider %s: %w", providerName, err)
 			}
+			models.ApplyBaseURL(provider, providerConfig.BaseURL)
 		}
 		provider.SetVerbose(verbose)
 

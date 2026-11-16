@@ -123,6 +123,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		models.ApplyBaseURL(provider, providerConfig.BaseURL)
 	}
 	provider.SetVerbose(config.Verbose)
 

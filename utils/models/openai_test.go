@@ -106,3 +106,21 @@ func TestGPT56UsesReasoningModelTokenParameter(t *testing.T) {
 		t.Fatalf("GPT-5.6 request must not use legacy max_tokens; got %d", req.MaxTokens)
 	}
 }
+
+func TestClientConfigBaseURLPrecedence(t *testing.T) {
+	const def = "https://api.openai.com/v1"
+	tests := []struct {
+		name, cfg, env, want string
+	}{
+		{"config wins over env", "http://cfg/v1", "http://env/v1", "http://cfg/v1"},
+		{"env when no config", "", "http://env/v1", "http://env/v1"},
+		{"default when neither", "", "", def},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clientConfig("k", tt.cfg, tt.env).BaseURL; got != tt.want {
+				t.Errorf("BaseURL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

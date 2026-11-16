@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 // OpenAIProvider handles OpenAI family of models
 type OpenAIProvider struct {
 	apiKey  string
+	baseURL string // provider config base_url; empty falls back to OPENAI_BASE_URL, then the OpenAI default
 	config  ModelConfig
 	verbose bool
 	mu      sync.Mutex
@@ -113,6 +115,32 @@ func (o *OpenAIProvider) Configure(apiKey string) error {
 	return nil
 }
 
+// SetBaseURL sets the API base URL from the provider config (base_url key).
+func (o *OpenAIProvider) SetBaseURL(baseURL string) {
+	o.baseURL = baseURL
+}
+
+// clientConfig builds the go-openai config. Precedence: cfgBaseURL > OPENAI_BASE_URL > default.
+func clientConfig(apiKey, cfgBaseURL, envBaseURL string) openai.ClientConfig {
+	config := openai.DefaultConfig(apiKey)
+	if cfgBaseURL != "" {
+		config.BaseURL = cfgBaseURL
+	} else if envBaseURL != "" {
+		config.BaseURL = envBaseURL
+	}
+	return config
+}
+
+func (o *OpenAIProvider) newClient() *openai.Client {
+	return openai.NewClientWithConfig(clientConfig(o.apiKey, o.baseURL, os.Getenv("OPENAI_BASE_URL")))
+}
+
+// responsesURL returns the /responses endpoint under the configured base URL.
+func (o *OpenAIProvider) responsesURL() string {
+	base := clientConfig(o.apiKey, o.baseURL, os.Getenv("OPENAI_BASE_URL")).BaseURL
+	return strings.TrimRight(base, "/") + "/responses"
+}
+
 // isNewModelSeries checks if the model is part of the newer series (4o, o1, o3, o4, gpt-5)
 func (o *OpenAIProvider) isNewModelSeries(modelName string) bool {
 	modelName = strings.ToLower(modelName)
@@ -167,7 +195,7 @@ func (o *OpenAIProvider) SendPrompt(modelName string, prompt string) (string, er
 
 	o.debugf("Model validation passed, preparing API call")
 
-	client := openai.NewClient(o.apiKey)
+	client := o.newClient()
 
 	// Check if this is a vision input by looking for base64 image data
 	if strings.HasPrefix(modelName, "gpt-4") && strings.Contains(prompt, ";base64,") {
@@ -248,7 +276,7 @@ func (o *OpenAIProvider) SendPromptWithFile(modelName string, prompt string, fil
 		return "", fmt.Errorf("failed to read file: %v", err)
 	}
 
-	client := openai.NewClient(o.apiKey)
+	client := o.newClient()
 
 	// For GPT-4 Vision, handle image files
 	if strings.HasPrefix(modelName, "gpt-4") && strings.HasPrefix(file.MimeType, "image/") {
@@ -623,7 +651,7 @@ func (o *OpenAIProvider) SendPromptWithResponses(config ResponsesConfig) (string
 	// Use our generic retry mechanism instead of custom implementation
 	result, err := retry.WithRetry(
 		func() (interface{}, error) {
-			req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/responses", bytes.NewBuffer(jsonData))
+			req, err := http.NewRequestWithContext(ctx, "POST", o.responsesURL(), bytes.NewBuffer(jsonData))
 			if err != nil {
 				return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 			}
@@ -728,7 +756,7 @@ func (o *OpenAIProvider) SendPromptWithResponsesStream(config ResponsesConfig, h
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/responses", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", o.responsesURL(), bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
